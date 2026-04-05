@@ -1,0 +1,83 @@
+# mcp-auth-proxy configuration
+# See README.md for full documentation.
+
+[server]
+host = "127.0.0.1"
+port = 3100
+
+# ── Upstream MCP Servers ─────────────────────────────────────────────
+# Each upstream gets a path prefix for routing.
+# Requests to http://127.0.0.1:3100/<path_prefix>/... are forwarded
+# to the upstream with the prefix stripped.
+
+[[upstream]]
+name = "example-http"
+path_prefix = "/example"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[upstream.auth]
+method = "static"
+header = "Authorization"
+prefix = "Bearer"
+credential_ref = "op://Private/example-api/token"
+
+# [[upstream]]
+# name = "local-server"
+# path_prefix = "/local"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@example/mcp-server"]
+#
+# [upstream.auth]
+# method = "static"
+# header = "X-API-Key"
+# credential_ref = "op://Private/local-server/api-key"
+
+# [[upstream]]
+# name = "oauth-server"
+# path_prefix = "/oauth"
+# transport = "http"
+# url = "https://mcp.example.com"
+#
+# [upstream.auth]
+# method = "oauth"
+# header = "Authorization"
+#
+# [upstream.auth.oauth]
+# server_url = "https://auth.example.com"
+# scopes = ["mcp:read", "mcp:write"]
+# redirect_port = 8765
+# client_name = "mcp-auth-proxy"
+
+# ── Credential Provider ──────────────────────────────────────────────
+# Choose one: "onepassword", "bitwarden", or "keepass"
+
+[credential_provider]
+type = "onepassword"
+
+# For 1Password: set OP_SERVICE_ACCOUNT_TOKEN env var for automation,
+# or use interactive `op` CLI with biometric unlock.
+# References use op:// format: op://vault/item/field
+
+# [credential_provider]
+# type = "bitwarden"
+# Set BW_SESSION env var, or BW_CLIENTID + BW_CLIENTSECRET + BW_PASSWORD
+
+# [credential_provider]
+# type = "keepass"
+# database_path = "/path/to/passwords.kdbx"
+# password_env = "KEEPASS_PASSWORD"
+# key_file = "/path/to/keyfile"  # optional
+
+# ── Token Storage ────────────────────────────────────────────────────
+# Used for OAuth refresh tokens and DCR client credentials.
+# "keychain" uses OS keychain (macOS Keychain, Windows Credential Manager).
+# "encrypted_file" uses AES-256-GCM encrypted JSON file.
+
+[token_storage]
+type = "keychain"
+fallback = "encrypted_file"
+
+[token_storage.encrypted_file]
+path = "~/.config/mcp-auth-proxy/tokens.enc"

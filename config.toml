@@ -1,0 +1,23 @@
+# mcp-auth-proxy config — Context7 upstream
+
+[server]
+host = "127.0.0.1"
+port = 3100
+
+[[upstream]]
+name = "context7"
+path_prefix = "/context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+
+[upstream.auth]
+method = "static"
+header = "CONTEXT7_API_KEY"
+credential_ref = "op://Private/Context7/API-Key"
+
+[credential_provider]
+type = "onepassword"
+
+[token_storage]
+type = "keychain"
+fallback = "encrypted_file"

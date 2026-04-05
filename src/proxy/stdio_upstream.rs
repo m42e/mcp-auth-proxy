@@ -1,0 +1,236 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use axum::{
+    body::Body,
+    extract::Request,
+    response::{IntoResponse, Response},
+};
+use http::StatusCode;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// Stdio upstream transport — bridges HTTP to a child process speaking JSON-RPC over stdio.
+pub struct StdioUpstream {
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    process: Mutex<Option<ManagedProcess>>,
+}
+
+struct ManagedProcess {
+    child: Child,
+    stdin: tokio::io::BufWriter<tokio::process::ChildStdin>,
+    pending: Arc<RwLock<HashMap<Value, tokio::sync::oneshot::Sender<Value>>>>,
+    _reader_handle: tokio::task::JoinHandle<()>,
+}
+
+impl StdioUpstream {
+    pub fn new(command: String, args: Vec<String>, env: HashMap<String, String>) -> Self {
+        Self {
+            command,
+            args,
+            env,
+            process: Mutex::new(None),
+        }
+    }
+
+    /// Ensure the child process is running, spawning it if needed.
+    async fn ensure_process(&self) -> Result<()> {
+        let mut proc_guard = self.process.lock().await;
+        if proc_guard.is_some() {
+            // Check if still alive
+            if let Some(ref mut managed) = *proc_guard {
+                match managed.child.try_wait() {
+                    Ok(Some(status)) => {
+                        warn!(status = %status, "stdio child process exited — restarting");
+                        *proc_guard = None;
+                    }
+                    Ok(None) => return Ok(()), // Still running
+                    Err(e) => {
+                        warn!(error = %e, "failed to check child process status — restarting");
+                        *proc_guard = None;
+                    }
+                }
+            }
+        }
+
+        info!(command = %self.command, "spawning stdio upstream process");
+
+        let mut cmd = Command::new(&self.command);
+        cmd.args(&self.args);
+        cmd.envs(&self.env);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::inherit());
+
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "failed to spawn stdio upstream: {} {}",
+                self.command,
+                self.args.join(" ")
+            )
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture child stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture child stdout"))?;
+
+        let stdin = tokio::io::BufWriter::new(stdin);
+        let pending: Arc<RwLock<HashMap<Value, tokio::sync::oneshot::Sender<Value>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Spawn reader task
+        let pending_clone = pending.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        debug!("stdio upstream stdout closed");
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        match serde_json::from_str::<Value>(trimmed) {
+                            Ok(msg) => {
+                                if let Some(id) = msg.get("id") {
+                                    let mut pending = pending_clone.write().await;
+                                    if let Some(sender) = pending.remove(id) {
+                                        let _ = sender.send(msg);
+                                    } else {
+                                        debug!(id = %id, "received response for unknown request id");
+                                    }
+                                } else {
+                                    // Notification — log but discard for now
+                                    debug!(method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("unknown"), "received notification from stdio upstream");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, line = %trimmed, "failed to parse JSON from stdio upstream");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "error reading from stdio upstream");
+                        break;
+                    }
+                }
+            }
+        });
+
+        *proc_guard = Some(ManagedProcess {
+            child,
+            stdin,
+            pending,
+            _reader_handle: reader_handle,
+        });
+
+        Ok(())
+    }
+
+    pub async fn forward(
+        &self,
+        request: Request<Body>,
+        _auth_header_name: &str,
+        _auth_header_value: &str,
+    ) -> Result<Response> {
+        self.ensure_process().await?;
+
+        // Read request body as JSON
+        let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .context("failed to read request body")?;
+
+        if body_bytes.is_empty() {
+            return Ok((StatusCode::BAD_REQUEST, "empty request body").into_response());
+        }
+
+        let msg: Value =
+            serde_json::from_slice(&body_bytes).context("request body is not valid JSON")?;
+
+        let is_notification = msg.get("id").is_none();
+        let request_id = msg.get("id").cloned();
+
+        // Send to child process
+        let mut proc_guard = self.process.lock().await;
+        let managed = proc_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("stdio process not available"))?;
+
+        let rx = if let Some(ref id) = request_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            managed.pending.write().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
+
+        // Write message to stdin
+        let msg_bytes = serde_json::to_vec(&msg).context("failed to serialize message")?;
+        managed
+            .stdin
+            .write_all(&msg_bytes)
+            .await
+            .context("failed to write to stdio upstream stdin")?;
+        managed
+            .stdin
+            .write_all(b"\n")
+            .await
+            .context("failed to write newline to stdio upstream stdin")?;
+        managed
+            .stdin
+            .flush()
+            .await
+            .context("failed to flush stdio upstream stdin")?;
+
+        drop(proc_guard); // Release lock while waiting for response
+
+        if is_notification {
+            // Notifications don't expect a response
+            return Ok((StatusCode::ACCEPTED, "").into_response());
+        }
+
+        // Wait for response
+        let rx = rx.unwrap();
+        let response_msg = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .context("timeout waiting for stdio upstream response")?
+            .context("stdio reader task dropped")?;
+
+        let response_body =
+            serde_json::to_vec(&response_msg).context("failed to serialize response")?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(response_body))
+            .unwrap()
+            .into_response())
+    }
+}
+
+impl Drop for StdioUpstream {
+    fn drop(&mut self) {
+        // Best-effort process cleanup
+        if let Some(mut managed) = self.process.get_mut().take() {
+            let _ = managed.child.start_kill();
+        }
+    }
+}
