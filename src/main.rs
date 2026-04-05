@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod credential;
+mod mcp_logging;
 mod proxy;
 mod settings;
 mod storage;
@@ -79,6 +80,7 @@ async fn main() -> Result<()> {
     // Build upstream states
     let mut upstreams = Vec::new();
     for upstream_config in &config.upstreams {
+        let upstream_route_name = upstream_config.path_prefix.trim_start_matches('/').to_string();
         let auth_strategy = auth::create_auth_strategy(
             &upstream_config.auth,
             &upstream_config.name,
@@ -89,7 +91,11 @@ async fn main() -> Result<()> {
         let http = match upstream_config.transport {
             TransportType::Http => {
                 let url = upstream_config.url.as_ref().unwrap();
-                Some(proxy::http_upstream::HttpUpstream::new(url.clone())?)
+                Some(proxy::http_upstream::HttpUpstream::new(
+                    upstream_route_name.clone(),
+                    url.clone(),
+                    upstream_config.log_mcp_traffic,
+                )?)
             }
             TransportType::Stdio => None,
         };
@@ -98,16 +104,18 @@ async fn main() -> Result<()> {
             TransportType::Stdio => {
                 let command = upstream_config.command.as_ref().unwrap().clone();
                 Some(proxy::stdio_upstream::StdioUpstream::new(
+                    upstream_route_name.clone(),
                     command,
                     upstream_config.args.clone(),
                     upstream_config.env.clone(),
+                    upstream_config.log_mcp_traffic,
                 ))
             }
             TransportType::Http => None,
         };
 
         upstreams.push(Arc::new(proxy::UpstreamState {
-            name: upstream_config.path_prefix.trim_start_matches('/').to_string(),
+            name: upstream_route_name,
             transport: upstream_config.transport.clone(),
             auth: auth_strategy,
             http,
@@ -115,6 +123,7 @@ async fn main() -> Result<()> {
             from_config: true,
             auth_header: upstream_config.auth.header.clone(),
             credential_ref: upstream_config.auth.credential_ref.clone(),
+            log_mcp_traffic: upstream_config.log_mcp_traffic,
         }));
     }
 
@@ -146,7 +155,11 @@ async fn main() -> Result<()> {
             token_storage.clone(),
         ) {
             Ok(auth_strategy) => {
-                match proxy::http_upstream::HttpUpstream::new(server.url.clone()) {
+                match proxy::http_upstream::HttpUpstream::new(
+                    server.name.clone(),
+                    server.url.clone(),
+                    server.log_mcp_traffic,
+                ) {
                     Ok(http) => {
                         upstreams.push(Arc::new(proxy::UpstreamState {
                             name: server.name.clone(),
@@ -157,6 +170,7 @@ async fn main() -> Result<()> {
                             from_config: false,
                             auth_header: server.auth_header.clone(),
                             credential_ref: Some(server.credential_ref.clone()),
+                            log_mcp_traffic: server.log_mcp_traffic,
                         }));
                         info!(server = %server.name, "restored persisted MCP server");
                     }

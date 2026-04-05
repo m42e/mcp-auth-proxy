@@ -66,6 +66,8 @@ pub struct McpServerConfig {
     pub auth_header: String,
     #[serde(default)]
     pub auth_prefix: Option<String>,
+    #[serde(default)]
+    pub log_mcp_traffic: bool,
     pub credential_ref: String,
     /// Additional headers to inject, each resolved via the credential provider
     #[serde(default)]

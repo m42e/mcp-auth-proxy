@@ -51,7 +51,10 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
 .field { margin-bottom: 14px; }
 .field label { display: block; font-size: 12px; font-weight: 600; color: #444; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
 .field input[type="text"] { width: 100%; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-family: inherit; }
+.field input[type="checkbox"] { margin-right: 8px; }
 .field input[type="text"]:focus { outline: none; border-color: #3b7dd8; box-shadow: 0 0 0 2px rgba(59,125,216,0.15); }
+.field-inline label { display: flex; align-items: center; font-size: 13px; font-weight: 500; text-transform: none; letter-spacing: 0; cursor: pointer; }
+.field-note { margin-top: 6px; color: #777; font-size: 12px; }
 
 .tool-picker { border: 1px solid #e0e0e0; border-radius: 4px; max-height: 260px; overflow-y: auto; }
 .tool-picker-group { border-bottom: 1px solid #eee; }
@@ -167,6 +170,10 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
       <div class="field">
         <label>Credential Reference</label>
         <input type="text" id="server-credential-ref" placeholder="op://Private/my-server/api-key">
+      </div>
+      <div class="field field-inline">
+        <label><input type="checkbox" id="server-log-mcp-traffic"> Log MCP calls and responses</label>
+        <p class="field-note">Logs can get large quickly when this is enabled.</p>
       </div>
     </div>
     <div class="modal-footer">
@@ -383,6 +390,7 @@ function renderServers(servers) {
   tb.innerHTML = servers.sort((a, b) => a.name.localeCompare(b.name)).map(s => {
     const authInfo = (s.auth_prefix ? esc(s.auth_prefix) + ' ' : '') + '<code>' + esc(s.auth_header) + '</code>';
     const source = s.from_config ? ' <span class="tag">config</span>' : '';
+    const logging = s.log_mcp_traffic ? ' <span class="tag">logging</span>' : '';
     const actions = s.from_config
       ? '<span style="color:#999;font-size:12px">from config</span>'
       : '<div class="actions">' +
@@ -390,7 +398,7 @@ function renderServers(servers) {
           '<button class="btn btn-sm btn-danger" onclick="deleteServer(\'' + esc(s.name) + '\')">Delete</button>' +
         '</div>';
     const urlDisplay = s.url ? '<code>' + esc(s.url) + '</code>' : '<span style="color:#999">' + esc(s.transport) + '</span>';
-    return '<tr><td><strong>' + esc(s.name) + '</strong>' + source + '</td>' +
+    return '<tr><td><strong>' + esc(s.name) + '</strong>' + source + logging + '</td>' +
       '<td>' + urlDisplay + '</td>' +
       '<td>' + authInfo + '</td>' +
       '<td>' + actions + '</td></tr>';
@@ -407,6 +415,7 @@ function openCreateServer() {
   document.getElementById('server-auth-header').value = 'Authorization';
   document.getElementById('server-auth-prefix').value = '';
   document.getElementById('server-credential-ref').value = '';
+  document.getElementById('server-log-mcp-traffic').checked = false;
   document.getElementById('server-overlay').classList.add('open');
 }
 
@@ -422,6 +431,7 @@ async function openEditServer(name) {
     document.getElementById('server-auth-header').value = server.auth_header || 'Authorization';
     document.getElementById('server-auth-prefix').value = server.auth_prefix || '';
     document.getElementById('server-credential-ref').value = server.credential_ref;
+    document.getElementById('server-log-mcp-traffic').checked = !!server.log_mcp_traffic;
     document.getElementById('server-overlay').classList.add('open');
   } catch (e) { toast('Failed to load server: ' + e.message, false); }
 }
@@ -436,12 +446,13 @@ async function saveServer() {
   const auth_header = document.getElementById('server-auth-header').value.trim() || 'Authorization';
   const auth_prefix = document.getElementById('server-auth-prefix').value.trim() || null;
   const credential_ref = document.getElementById('server-credential-ref').value.trim();
+  const log_mcp_traffic = document.getElementById('server-log-mcp-traffic').checked;
 
   if (!name) { toast('Server name is required', false); return; }
   if (!url) { toast('URL is required', false); return; }
   if (!credential_ref) { toast('Credential reference is required', false); return; }
 
-  const body = JSON.stringify({ name, url, auth_header, auth_prefix, credential_ref });
+  const body = JSON.stringify({ name, url, auth_header, auth_prefix, credential_ref, log_mcp_traffic });
   const headers = { 'Content-Type': 'application/json' };
   try {
     if (editingServer) {

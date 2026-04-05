@@ -14,11 +14,15 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::mcp_logging;
+
 /// Stdio upstream transport — bridges HTTP to a child process speaking JSON-RPC over stdio.
 pub struct StdioUpstream {
+    upstream_name: String,
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
+    log_mcp_traffic: bool,
     process: Mutex<Option<ManagedProcess>>,
 }
 
@@ -30,11 +34,19 @@ struct ManagedProcess {
 }
 
 impl StdioUpstream {
-    pub fn new(command: String, args: Vec<String>, env: HashMap<String, String>) -> Self {
+    pub fn new(
+        upstream_name: String,
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        log_mcp_traffic: bool,
+    ) -> Self {
         Self {
+            upstream_name,
             command,
             args,
             env,
+            log_mcp_traffic,
             process: Mutex::new(None),
         }
     }
@@ -91,6 +103,8 @@ impl StdioUpstream {
 
         // Spawn reader task
         let pending_clone = pending.clone();
+        let upstream_name = self.upstream_name.clone();
+        let log_mcp_traffic = self.log_mcp_traffic;
         let reader_handle = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -110,6 +124,14 @@ impl StdioUpstream {
 
                         match serde_json::from_str::<Value>(trimmed) {
                             Ok(msg) => {
+                                if log_mcp_traffic {
+                                    mcp_logging::log_response(
+                                        &upstream_name,
+                                        "stdio",
+                                        Some(200),
+                                        trimmed.as_bytes(),
+                                    );
+                                }
                                 if let Some(id) = msg.get("id") {
                                     let mut pending = pending_clone.write().await;
                                     if let Some(sender) = pending.remove(id) {
@@ -164,6 +186,10 @@ impl StdioUpstream {
         let msg: Value =
             serde_json::from_slice(&body_bytes).context("request body is not valid JSON")?;
 
+        if self.log_mcp_traffic {
+            mcp_logging::log_request(&self.upstream_name, "stdio", &body_bytes);
+        }
+
         let is_notification = msg.get("id").is_none();
         let request_id = msg.get("id").cloned();
 
@@ -203,6 +229,9 @@ impl StdioUpstream {
 
         if is_notification {
             // Notifications don't expect a response
+            if self.log_mcp_traffic {
+                mcp_logging::log_notification_ack(&self.upstream_name, "stdio");
+            }
             return Ok((StatusCode::ACCEPTED, "").into_response());
         }
 
@@ -302,6 +331,11 @@ impl StdioUpstream {
             }
         });
 
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&init_msg).context("failed to serialize initialize request")?;
+            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
+        }
+
         let init_resp = self.send_jsonrpc(&init_msg).await?;
         if init_resp.get("error").is_some() {
             anyhow::bail!("initialize failed: {}", init_resp.get("error").unwrap());
@@ -320,10 +354,19 @@ impl StdioUpstream {
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized"
             });
+            if self.log_mcp_traffic {
+                let payload = serde_json::to_vec(&notif)
+                    .context("failed to serialize initialized notification")?;
+                mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
+            }
             let notif_bytes = serde_json::to_vec(&notif)?;
             managed.stdin.write_all(&notif_bytes).await?;
             managed.stdin.write_all(b"\n").await?;
             managed.stdin.flush().await?;
+        }
+
+        if self.log_mcp_traffic {
+            mcp_logging::log_notification_ack(&self.upstream_name, "stdio");
         }
 
         // Step 3: tools/list
@@ -332,6 +375,11 @@ impl StdioUpstream {
             "method": "tools/list",
             "id": 1000002
         });
+
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&tools_msg).context("failed to serialize tools/list request")?;
+            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
+        }
 
         let tools_resp = self.send_jsonrpc(&tools_msg).await?;
         if tools_resp.get("error").is_some() {

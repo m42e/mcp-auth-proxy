@@ -10,14 +10,18 @@ use reqwest::Client;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::mcp_logging;
+
 /// HTTP upstream transport — forwards requests to an HTTP MCP server.
 pub struct HttpUpstream {
     client: Client,
     base_url: String,
+    upstream_name: String,
+    log_mcp_traffic: bool,
 }
 
 impl HttpUpstream {
-    pub fn new(base_url: String) -> Result<Self> {
+    pub fn new(upstream_name: String, base_url: String, log_mcp_traffic: bool) -> Result<Self> {
         let client = Client::builder()
             .build()
             .context("failed to create HTTP client for upstream")?;
@@ -25,7 +29,12 @@ impl HttpUpstream {
         // Normalize: strip trailing slash
         let base_url = base_url.trim_end_matches('/').to_string();
 
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            upstream_name,
+            log_mcp_traffic,
+        })
     }
 
     pub fn url(&self) -> &str {
@@ -79,6 +88,10 @@ impl HttpUpstream {
             .await
             .context("failed to read request body")?;
 
+        if self.log_mcp_traffic {
+            mcp_logging::log_request(&self.upstream_name, "http", &body_bytes);
+        }
+
         if !body_bytes.is_empty() {
             upstream_req = upstream_req.body(body_bytes);
         }
@@ -117,6 +130,17 @@ impl HttpUpstream {
         if is_sse {
             // Stream SSE responses
             debug!("streaming SSE response from upstream");
+            if self.log_mcp_traffic {
+                let content_type = resp_headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok());
+                mcp_logging::log_streaming_response(
+                    &self.upstream_name,
+                    "http",
+                    status.as_u16(),
+                    content_type,
+                );
+            }
             let stream = upstream_resp.bytes_stream().map(|result| {
                 result.map_err(|e| {
                     std::io::Error::other(e.to_string())
@@ -130,6 +154,14 @@ impl HttpUpstream {
                 .bytes()
                 .await
                 .context("failed to read upstream response body")?;
+            if self.log_mcp_traffic {
+                mcp_logging::log_response(
+                    &self.upstream_name,
+                    "http",
+                    Some(status.as_u16()),
+                    body_bytes.as_ref(),
+                );
+            }
             let body = Body::from(body_bytes);
             Ok(response_builder.body(body).unwrap().into_response())
         }
@@ -175,6 +207,11 @@ impl HttpUpstream {
             }
         });
 
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&init_body).context("failed to serialize initialize request")?;
+            mcp_logging::log_request(&self.upstream_name, "http", &payload);
+        }
+
         let mut init_req = self
             .client
             .post(&self.base_url)
@@ -189,6 +226,8 @@ impl HttpUpstream {
             .await
             .context("failed to send initialize request")?;
 
+        let init_status = init_resp.status().as_u16();
+
         let session_id = init_resp
             .headers()
             .get("mcp-session-id")
@@ -199,6 +238,12 @@ impl HttpUpstream {
             .json()
             .await
             .context("failed to parse initialize response")?;
+
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&init_result)
+                .context("failed to serialize initialize response")?;
+            mcp_logging::log_response(&self.upstream_name, "http", Some(init_status), &payload);
+        }
 
         if init_result.get("error").is_some() {
             anyhow::bail!(
@@ -214,6 +259,12 @@ impl HttpUpstream {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
+
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&notif_body)
+                .context("failed to serialize initialized notification")?;
+            mcp_logging::log_request(&self.upstream_name, "http", &payload);
+        }
 
         let mut notif_req = self
             .client
@@ -234,6 +285,15 @@ impl HttpUpstream {
             .await
             .context("failed to send initialized notification")?;
 
+        if self.log_mcp_traffic {
+            mcp_logging::log_response(
+                &self.upstream_name,
+                "http",
+                Some(notif_resp.status().as_u16()),
+                &[],
+            );
+        }
+
         if !notif_resp.status().is_success() {
             warn!(
                 status = %notif_resp.status(),
@@ -247,6 +307,11 @@ impl HttpUpstream {
             "method": "tools/list",
             "id": 2
         });
+
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&tools_body).context("failed to serialize tools/list request")?;
+            mcp_logging::log_request(&self.upstream_name, "http", &payload);
+        }
 
         let mut tools_req = self
             .client
@@ -267,10 +332,18 @@ impl HttpUpstream {
             .await
             .context("failed to send tools/list request")?;
 
+        let tools_status = tools_resp.status().as_u16();
+
         let body: Value = tools_resp
             .json()
             .await
             .context("failed to parse tools/list response")?;
+
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(&body)
+                .context("failed to serialize tools/list response")?;
+            mcp_logging::log_response(&self.upstream_name, "http", Some(tools_status), &payload);
+        }
 
         if body.get("error").is_some() {
             anyhow::bail!("tools/list failed: {}", body.get("error").unwrap());

@@ -36,6 +36,8 @@ pub struct UpstreamState {
     pub auth_header: String,
     /// Credential reference for display purposes.
     pub credential_ref: Option<String>,
+    /// Whether MCP request and response payloads should be logged.
+    pub log_mcp_traffic: bool,
 }
 
 /// Shared application state.
@@ -237,6 +239,7 @@ struct ServerInfo {
     url: String,
     auth_header: String,
     auth_prefix: Option<String>,
+    log_mcp_traffic: bool,
     credential_ref: Option<String>,
     from_config: bool,
     transport: String,
@@ -261,6 +264,7 @@ async fn list_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 url,
                 auth_header: u.auth_header.clone(),
                 auth_prefix: None,
+                log_mcp_traffic: u.log_mcp_traffic,
                 credential_ref: u.credential_ref.clone(),
                 from_config: u.from_config,
                 transport: transport.to_string(),
@@ -297,6 +301,7 @@ async fn get_server(
                 "name": u.name,
                 "url": url,
                 "auth_header": u.auth_header,
+                "log_mcp_traffic": u.log_mcp_traffic,
                 "credential_ref": u.credential_ref,
                 "from_config": true,
             }))
@@ -425,7 +430,11 @@ async fn register_dynamic_upstream(
         state.token_storage.clone(),
     )?;
 
-    let http = http_upstream::HttpUpstream::new(server.url.clone())?;
+    let http = http_upstream::HttpUpstream::new(
+        server.name.clone(),
+        server.url.clone(),
+        server.log_mcp_traffic,
+    )?;
 
     let upstream = Arc::new(UpstreamState {
         name: server.name.clone(),
@@ -436,6 +445,7 @@ async fn register_dynamic_upstream(
         from_config: false,
         auth_header: server.auth_header.clone(),
         credential_ref: Some(server.credential_ref.clone()),
+        log_mcp_traffic: server.log_mcp_traffic,
     });
 
     state

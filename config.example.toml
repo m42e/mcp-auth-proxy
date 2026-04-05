@@ -14,6 +14,7 @@ port = 3100
 name = "example-http"
 path_prefix = "/example"
 transport = "http"
+log_mcp_traffic = false
 url = "https://api.example.com/mcp"
 
 [upstream.auth]
@@ -32,6 +33,7 @@ credential_ref = "op://Private/example-api/token"
 # name = "local-server"
 # path_prefix = "/local"
 # transport = "stdio"
+# log_mcp_traffic = true
 # command = "npx"
 # args = ["-y", "@example/mcp-server"]
 #

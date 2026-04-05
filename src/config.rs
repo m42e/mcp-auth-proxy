@@ -33,6 +33,8 @@ pub struct UpstreamConfig {
     pub path_prefix: String,
     #[serde(default = "default_transport")]
     pub transport: TransportType,
+    #[serde(default)]
+    pub log_mcp_traffic: bool,
     /// URL for HTTP upstream
     pub url: Option<String>,
     /// Command for stdio upstream
