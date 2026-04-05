@@ -41,7 +41,7 @@ jobs:
       - name: Verify tag does not exist
         run: |
           TAG="v${{ steps.version.outputs.version }}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::Tag $TAG already exists"
             exit 1
           fi

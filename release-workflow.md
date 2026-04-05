@@ -117,7 +117,7 @@ The job runs only when all of these conditions are true:
 1. Checks out the merge commit produced by the pull request.
 2. Reads the version from `Cargo.toml`.
 3. Verifies that the release branch name matches that version.
-4. Verifies that the tag does not already exist.
+4. Verifies that the tag does not already exist on the remote repository.
 5. Creates an annotated tag `vX.Y.Z` on the merge commit.
 6. Pushes the tag.
 7. Dispatches the release workflow and passes the tag as an explicit input.
@@ -179,7 +179,7 @@ The `publish` job runs only after all matrix builds complete. It:
 
 1. Checks out the tagged revision.
 2. Downloads all packaged artifacts into `dist/`.
-3. Generates release notes with `git-cliff`.
+3. Generates release notes for the checked-out tag with `git-cliff`.
 4. Creates or updates the GitHub release with the generated notes and all built archives.
 
 ### Why build and publish are split
@@ -199,10 +199,10 @@ The release matrix currently contains four targets:
 
 | Runner | Rust target | Output binary | Archive format |
 | --- | --- | --- | --- |
-| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `transfer-rs` | `.tar.gz` |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `transfer-rs.exe` | `.zip` |
-| `macos-14` | `x86_64-apple-darwin` | `transfer-rs` | `.tar.gz` |
-| `macos-14` | `aarch64-apple-darwin` | `transfer-rs` | `.tar.gz` |
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `mcp-auth-proxy` | `.tar.gz` |
+| `windows-latest` | `x86_64-pc-windows-msvc` | `mcp-auth-proxy.exe` | `.zip` |
+| `macos-14` | `x86_64-apple-darwin` | `mcp-auth-proxy` | `.tar.gz` |
+| `macos-14` | `aarch64-apple-darwin` | `mcp-auth-proxy` | `.tar.gz` |
 
 ### Why this matrix is structured this way
 
@@ -225,7 +225,7 @@ That target-specific cache key matters, especially when multiple matrix jobs run
 
 The naming pattern is:
 
-`transfer-rs-vX.Y.Z-<target>.<extension>`
+`mcp-auth-proxy-vX.Y.Z-<target>.<extension>`
 
 This is worth copying in other projects because it scales cleanly when more targets are added.
 

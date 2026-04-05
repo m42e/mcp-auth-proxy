@@ -111,13 +111,20 @@ jobs:
 
       - name: Generate release notes
         run: |
-          git-cliff --config .github/cliff.toml --latest --tag "$RELEASE_TAG" -o RELEASE_BODY.md
+          git-cliff --config .github/cliff.toml --current -o RELEASE_BODY.md
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         run: |
-          gh release create "$RELEASE_TAG" \
-            --title "$RELEASE_TAG" \
-            --notes-file RELEASE_BODY.md \
-            dist/*
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file RELEASE_BODY.md
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file RELEASE_BODY.md \
+              dist/*
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
