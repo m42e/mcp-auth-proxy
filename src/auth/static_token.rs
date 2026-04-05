@@ -87,9 +87,9 @@ impl StaticTokenAuth {
 
 #[async_trait]
 impl AuthStrategy for StaticTokenAuth {
-    async fn get_auth_header(&self) -> Result<(String, String)> {
+    async fn get_auth_headers(&self) -> Result<Vec<(String, String)>> {
         let value = self.get_or_resolve().await?;
-        Ok((self.header_name.clone(), value))
+        Ok(vec![(self.header_name.clone(), value)])
     }
 
     async fn handle_unauthorized(&self) -> Result<()> {

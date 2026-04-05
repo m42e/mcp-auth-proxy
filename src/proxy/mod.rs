@@ -13,11 +13,14 @@ use axum::{
 };
 use http::StatusCode;
 use serde_json::Value;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::AuthStrategy;
-use crate::config::TransportType;
-use crate::settings::{Profile, ProfileStore};
+use crate::auth::{self, AuthStrategy};
+use crate::config::{AuthConfig, AuthMethod, TransportType};
+use crate::credential::CredentialProvider;
+use crate::settings::{McpServerConfig, McpServerStore, Profile, ProfileStore};
+use crate::storage::TokenStorage;
 use crate::tool_cache::ToolCache;
 
 /// Shared state for a single upstream.
@@ -27,13 +30,22 @@ pub struct UpstreamState {
     pub auth: Arc<dyn AuthStrategy>,
     pub http: Option<http_upstream::HttpUpstream>,
     pub stdio: Option<stdio_upstream::StdioUpstream>,
+    /// Whether this upstream was loaded from the config file (not editable via UI).
+    pub from_config: bool,
+    /// Auth header name for display purposes.
+    pub auth_header: String,
+    /// Credential reference for display purposes.
+    pub credential_ref: Option<String>,
 }
 
 /// Shared application state.
 pub struct AppState {
-    pub upstreams: HashMap<String, Arc<UpstreamState>>,
+    pub upstreams: RwLock<HashMap<String, Arc<UpstreamState>>>,
     pub tool_cache: ToolCache,
     pub profile_store: ProfileStore,
+    pub mcp_server_store: McpServerStore,
+    pub credential_provider: Arc<dyn CredentialProvider>,
+    pub token_storage: Arc<dyn TokenStorage>,
 }
 
 /// Build the axum router with path-prefix routing, settings API, and profile support.
@@ -41,6 +53,9 @@ pub fn build_router(
     upstreams: Vec<Arc<UpstreamState>>,
     tool_cache: ToolCache,
     profile_store: ProfileStore,
+    mcp_server_store: McpServerStore,
+    credential_provider: Arc<dyn CredentialProvider>,
+    token_storage: Arc<dyn TokenStorage>,
 ) -> Router {
     let upstream_map: HashMap<String, Arc<UpstreamState>> = upstreams
         .into_iter()
@@ -48,9 +63,12 @@ pub fn build_router(
         .collect();
 
     let state = Arc::new(AppState {
-        upstreams: upstream_map,
+        upstreams: RwLock::new(upstream_map),
         tool_cache,
         profile_store,
+        mcp_server_store,
+        credential_provider,
+        token_storage,
     });
 
     Router::new()
@@ -75,6 +93,17 @@ pub fn build_router(
                 .put(update_profile)
                 .delete(delete_profile),
         )
+        // Settings API — MCP servers
+        .route(
+            "/settings/servers",
+            get(list_servers).post(create_server),
+        )
+        .route(
+            "/settings/servers/{name}",
+            get(get_server)
+                .put(update_server)
+                .delete(delete_server),
+        )
         // Everything else goes through the main router
         .fallback(root_handler)
         .with_state(state)
@@ -89,7 +118,7 @@ async fn settings_ui() -> impl IntoResponse {
 // ── Settings API: upstreams ────────────────────────────────────────
 
 async fn list_upstreams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let names: Vec<String> = state.upstreams.keys().cloned().collect();
+    let names: Vec<String> = state.upstreams.read().await.keys().cloned().collect();
     Json(names)
 }
 
@@ -103,7 +132,7 @@ async fn refresh_upstream_tools(
     State(state): State<Arc<AppState>>,
     Path(upstream_name): Path<String>,
 ) -> impl IntoResponse {
-    let upstream = match state.upstreams.get(&upstream_name) {
+    let upstream = match state.upstreams.read().await.get(&upstream_name) {
         Some(u) => u.clone(),
         None => {
             return (
@@ -151,7 +180,7 @@ async fn create_profile(
     State(state): State<Arc<AppState>>,
     Json(profile): Json<Profile>,
 ) -> impl IntoResponse {
-    if state.upstreams.contains_key(&profile.name) {
+    if state.upstreams.read().await.contains_key(&profile.name) {
         return (
             StatusCode::CONFLICT,
             "profile name conflicts with an upstream name",
@@ -200,6 +229,224 @@ async fn delete_profile(
     }
 }
 
+// ── Settings API: MCP servers ──────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct ServerInfo {
+    name: String,
+    url: String,
+    auth_header: String,
+    auth_prefix: Option<String>,
+    credential_ref: Option<String>,
+    from_config: bool,
+    transport: String,
+}
+
+async fn list_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let upstreams = state.upstreams.read().await;
+    let mut servers: Vec<ServerInfo> = upstreams
+        .values()
+        .map(|u| {
+            let url = u
+                .http
+                .as_ref()
+                .map(|h| h.url().to_string())
+                .unwrap_or_default();
+            let transport = match u.transport {
+                TransportType::Http => "http",
+                TransportType::Stdio => "stdio",
+            };
+            ServerInfo {
+                name: u.name.clone(),
+                url,
+                auth_header: u.auth_header.clone(),
+                auth_prefix: None,
+                credential_ref: u.credential_ref.clone(),
+                from_config: u.from_config,
+                transport: transport.to_string(),
+            }
+        })
+        .collect();
+    // Merge auth_prefix from dynamic server store
+    let dynamic = state.mcp_server_store.list().await;
+    for srv in &dynamic {
+        if let Some(info) = servers.iter_mut().find(|s| s.name == srv.name) {
+            info.auth_prefix = srv.auth_prefix.clone();
+        }
+    }
+    Json(servers)
+}
+
+async fn get_server(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Try dynamic store first
+    if let Some(server) = state.mcp_server_store.get(&name).await {
+        return Json(serde_json::json!(server)).into_response();
+    }
+    // Fall back to static upstream
+    if let Some(u) = state.upstreams.read().await.get(&name) {
+        if u.from_config {
+            let url = u
+                .http
+                .as_ref()
+                .map(|h| h.url().to_string())
+                .unwrap_or_default();
+            return Json(serde_json::json!({
+                "name": u.name,
+                "url": url,
+                "auth_header": u.auth_header,
+                "credential_ref": u.credential_ref,
+                "from_config": true,
+            }))
+            .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "server not found").into_response()
+}
+
+async fn create_server(
+    State(state): State<Arc<AppState>>,
+    Json(server): Json<McpServerConfig>,
+) -> impl IntoResponse {
+    if server.name.is_empty()
+        || !server
+            .name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "server name must be non-empty and contain only alphanumeric characters, hyphens, or underscores",
+        )
+            .into_response();
+    }
+    if server.name == "settings" {
+        return (StatusCode::CONFLICT, "name 'settings' is reserved").into_response();
+    }
+    if state.upstreams.read().await.contains_key(&server.name) {
+        return (
+            StatusCode::CONFLICT,
+            "name conflicts with an existing upstream",
+        )
+            .into_response();
+    }
+
+    match register_dynamic_upstream(&state, &server).await {
+        Ok(()) => {
+            state.mcp_server_store.upsert(server.clone()).await;
+            info!(server = %server.name, "created MCP server");
+            // Refresh tool cache in the background
+            let upstream = state.upstreams.read().await.get(&server.name).cloned();
+            if let Some(upstream) = upstream {
+                let tc = state.tool_cache.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tc.refresh_upstream(&upstream).await {
+                        warn!(upstream = %upstream.name, error = %e, "failed to cache tools for new server");
+                    }
+                });
+            }
+            (StatusCode::CREATED, Json(server)).into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "failed to register MCP server");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to register server: {}", e))
+                .into_response()
+        }
+    }
+}
+
+async fn update_server(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(mut server): Json<McpServerConfig>,
+) -> impl IntoResponse {
+    server.name = name;
+
+    // Remove old upstream, then re-register
+    state.upstreams.write().await.remove(&server.name);
+
+    match register_dynamic_upstream(&state, &server).await {
+        Ok(()) => {
+            state.mcp_server_store.upsert(server.clone()).await;
+            info!(server = %server.name, "updated MCP server");
+            // Refresh tool cache in the background
+            let upstream = state.upstreams.read().await.get(&server.name).cloned();
+            if let Some(upstream) = upstream {
+                let tc = state.tool_cache.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tc.refresh_upstream(&upstream).await {
+                        warn!(upstream = %upstream.name, error = %e, "failed to cache tools for updated server");
+                    }
+                });
+            }
+            Json(server).into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "failed to update MCP server");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to update server: {}", e))
+                .into_response()
+        }
+    }
+}
+
+async fn delete_server(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if state.mcp_server_store.delete(&name).await {
+        state.upstreams.write().await.remove(&name);
+        info!(server = %name, "deleted MCP server");
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "server not found").into_response()
+    }
+}
+
+/// Create an UpstreamState from a dynamic McpServerConfig and add it to the upstream map.
+async fn register_dynamic_upstream(
+    state: &AppState,
+    server: &McpServerConfig,
+) -> anyhow::Result<()> {
+    let auth_config = AuthConfig {
+        method: AuthMethod::Static,
+        header: server.auth_header.clone(),
+        prefix: server.auth_prefix.clone(),
+        credential_ref: Some(server.credential_ref.clone()),
+        oauth: None,
+        extra_headers: server.extra_headers.clone(),
+    };
+
+    let auth_strategy = auth::create_auth_strategy(
+        &auth_config,
+        &server.name,
+        state.credential_provider.clone(),
+        state.token_storage.clone(),
+    )?;
+
+    let http = http_upstream::HttpUpstream::new(server.url.clone())?;
+
+    let upstream = Arc::new(UpstreamState {
+        name: server.name.clone(),
+        transport: TransportType::Http,
+        auth: auth_strategy,
+        http: Some(http),
+        stdio: None,
+        from_config: false,
+        auth_header: server.auth_header.clone(),
+        credential_ref: Some(server.credential_ref.clone()),
+    });
+
+    state
+        .upstreams
+        .write()
+        .await
+        .insert(server.name.clone(), upstream);
+
+    Ok(())
+}
+
 // ── Proxy routing ──────────────────────────────────────────────────
 
 async fn root_handler(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
@@ -223,18 +470,20 @@ async fn root_handler(State(state): State<Arc<AppState>>, request: Request<Body>
                 .into_response();
         }
         let upstream_name = segments[1];
-        if let Some(upstream) = state.upstreams.get(upstream_name) {
+        if let Some(upstream) = state.upstreams.read().await.get(upstream_name) {
+            let upstream = upstream.clone();
             let remaining = build_remaining_path(&segments[2..], &query);
-            return proxy_with_filter(&state, upstream.clone(), request, &remaining, Some(profile))
+            return proxy_with_filter(&state, upstream, request, &remaining, Some(profile))
                 .await;
         }
         return not_found().into_response();
     }
 
     // Check if the first segment is an upstream name
-    if let Some(upstream) = state.upstreams.get(first) {
+    if let Some(upstream) = state.upstreams.read().await.get(first) {
+        let upstream = upstream.clone();
         let remaining = build_remaining_path(&segments[1..], &query);
-        return proxy_with_filter(&state, upstream.clone(), request, &remaining, None).await;
+        return proxy_with_filter(&state, upstream, request, &remaining, None).await;
     }
 
     not_found().into_response()
@@ -453,8 +702,8 @@ async fn filter_tools_list_response(response: Response, allowed_tools: &[String]
 }
 
 async fn do_proxy(upstream: &UpstreamState, request: Request<Body>) -> anyhow::Result<Response> {
-    // Get auth header
-    let (header_name, header_value) = upstream.auth.get_auth_header().await?;
+    // Get auth headers
+    let auth_headers = upstream.auth.get_auth_headers().await?;
 
     match upstream.transport {
         TransportType::Http => {
@@ -462,14 +711,14 @@ async fn do_proxy(upstream: &UpstreamState, request: Request<Body>) -> anyhow::R
                 .http
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("HTTP upstream not configured"))?;
-            http.forward(request, &header_name, &header_value).await
+            http.forward(request, &auth_headers).await
         }
         TransportType::Stdio => {
             let stdio = upstream
                 .stdio
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("stdio upstream not configured"))?;
-            stdio.forward(request, &header_name, &header_value).await
+            stdio.forward(request, &auth_headers).await
         }
     }
 }

@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Auth Proxy — Settings</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a; background: #fafafa; font-size: 14px; line-height: 1.5; }
+a { color: #3b7dd8; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.container { max-width: 860px; margin: 0 auto; padding: 32px 24px; }
+h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+.subtitle { color: #666; font-size: 13px; margin-bottom: 32px; }
+
+.section { margin-bottom: 36px; }
+.section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.section-header h2 { font-size: 15px; font-weight: 600; }
+
+table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e0e0e0; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; font-size: 13px; }
+th { background: #f5f5f5; font-weight: 600; color: #444; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #f9f9f9; }
+
+.tag { display: inline-block; background: #eef2f7; color: #3b6; border-radius: 3px; padding: 1px 6px; font-size: 12px; margin: 1px 2px; }
+.tag-tool { background: #f0f0f0; color: #555; }
+
+.empty { color: #999; font-style: italic; padding: 20px 12px; text-align: center; }
+
+button, .btn { display: inline-block; padding: 5px 14px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; background: #fff; color: #333; cursor: pointer; font-family: inherit; }
+button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
+.btn-primary { background: #3b7dd8; color: #fff; border-color: #3b7dd8; }
+.btn-primary:hover { background: #336db8; }
+.btn-sm { padding: 3px 10px; font-size: 12px; }
+.btn-danger { color: #c33; border-color: #daa; }
+.btn-danger:hover { background: #fef0f0; }
+
+.actions { display: flex; gap: 6px; }
+
+/* Modal / form overlay */
+.overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.25); z-index: 10; align-items: flex-start; justify-content: center; padding-top: 80px; }
+.overlay.open { display: flex; }
+.modal { background: #fff; border: 1px solid #ddd; border-radius: 6px; width: 520px; max-width: 95vw; max-height: 80vh; overflow-y: auto; }
+.modal-header { padding: 14px 18px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+.modal-header h3 { font-size: 15px; font-weight: 600; }
+.modal-body { padding: 18px; }
+.modal-footer { padding: 12px 18px; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 8px; }
+
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 12px; font-weight: 600; color: #444; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
+.field input[type="text"] { width: 100%; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-family: inherit; }
+.field input[type="text"]:focus { outline: none; border-color: #3b7dd8; box-shadow: 0 0 0 2px rgba(59,125,216,0.15); }
+
+.tool-picker { border: 1px solid #e0e0e0; border-radius: 4px; max-height: 260px; overflow-y: auto; }
+.tool-picker-group { border-bottom: 1px solid #eee; }
+.tool-picker-group:last-child { border-bottom: none; }
+.tool-picker-group-header { padding: 6px 10px; background: #f7f7f7; font-size: 12px; font-weight: 600; color: #555; display: flex; align-items: center; gap: 8px; }
+.tool-picker-group-header label { text-transform: none; letter-spacing: 0; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.tool-item { padding: 4px 10px 4px 26px; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.tool-item label { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.tool-item:hover { background: #fafafa; }
+
+.refresh-icon { cursor: pointer; font-size: 14px; color: #888; }
+.refresh-icon:hover { color: #3b7dd8; }
+
+.status { position: fixed; bottom: 20px; right: 20px; padding: 8px 16px; border-radius: 4px; font-size: 13px; display: none; z-index: 20; }
+.status.ok { display: block; background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
+.status.err { display: block; background: #fce4ec; color: #c62828; border: 1px solid #f8bbd0; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <h1>MCP Auth Proxy</h1>
+  <p class="subtitle">Manage MCP servers, profiles, and view cached upstream tools</p>
+
+  <!-- Tools section -->
+  <div class="section">
+    <div class="section-header">
+      <h2>Upstream Tools</h2>
+      <button class="btn btn-sm" onclick="refreshAllTools()">Refresh All</button>
+    </div>
+    <table>
+      <thead><tr><th>Upstream</th><th>Tools</th><th style="width:60px"></th></tr></thead>
+      <tbody id="tools-body"></tbody>
+    </table>
+    <div id="tools-empty" class="empty" style="display:none">No upstreams configured</div>
+  </div>
+
+  <!-- MCP Servers section -->
+  <div class="section">
+    <div class="section-header">
+      <h2>MCP Servers</h2>
+      <button class="btn btn-sm btn-primary" onclick="openCreateServer()">Add Server</button>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>URL</th><th>Auth</th><th style="width:100px"></th></tr></thead>
+      <tbody id="servers-body"></tbody>
+    </table>
+    <div id="servers-empty" class="empty" style="display:none">No additional MCP servers configured</div>
+  </div>
+
+  <!-- Profiles section -->
+  <div class="section">
+    <div class="section-header">
+      <h2>Profiles</h2>
+      <button class="btn btn-sm btn-primary" onclick="openCreateProfile()">New Profile</button>
+    </div>
+    <table>
+      <thead><tr><th>Profile</th><th>Prefix</th><th>Allowed Tools</th><th style="width:100px"></th></tr></thead>
+      <tbody id="profiles-body"></tbody>
+    </table>
+    <div id="profiles-empty" class="empty" style="display:none">No profiles defined yet</div>
+  </div>
+</div>
+
+<!-- Profile modal -->
+<div class="overlay" id="profile-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">New Profile</h3>
+      <button class="btn btn-sm" onclick="closeModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>Profile Name</label>
+        <input type="text" id="profile-name" placeholder="e.g. readonly">
+      </div>
+      <div class="field">
+        <label>Allowed Tools</label>
+        <div class="tool-picker" id="tool-picker"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="modal-save" onclick="saveProfile()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Server modal -->
+<div class="overlay" id="server-overlay" onclick="if(event.target===this)closeServerModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="server-modal-title">Add MCP Server</h3>
+      <button class="btn btn-sm" onclick="closeServerModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>Name</label>
+        <input type="text" id="server-name" placeholder="e.g. my-server">
+      </div>
+      <div class="field">
+        <label>URL</label>
+        <input type="text" id="server-url" placeholder="https://api.example.com/mcp">
+      </div>
+      <div class="field">
+        <label>Auth Header</label>
+        <input type="text" id="server-auth-header" placeholder="Authorization" value="Authorization">
+      </div>
+      <div class="field">
+        <label>Auth Prefix <span style="font-weight:normal;color:#999">(optional, e.g. Bearer)</span></label>
+        <input type="text" id="server-auth-prefix" placeholder="Bearer">
+      </div>
+      <div class="field">
+        <label>Credential Reference</label>
+        <input type="text" id="server-credential-ref" placeholder="op://Private/my-server/api-key">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeServerModal()">Cancel</button>
+      <button class="btn btn-primary" id="server-modal-save" onclick="saveServer()">Add</button>
+    </div>
+  </div>
+</div>
+
+<div class="status" id="status-toast"></div>
+
+<script>
+const API = '';
+let cachedTools = {};
+let editingProfile = null;
+
+async function api(path, opts) {
+  const r = await fetch(API + path, opts);
+  if (!r.ok && r.status !== 204) {
+    const txt = await r.text();
+    throw new Error(txt || r.statusText);
+  }
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+function toast(msg, ok) {
+  const el = document.getElementById('status-toast');
+  el.textContent = msg;
+  el.className = 'status ' + (ok ? 'ok' : 'err');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = 'status', 2500);
+}
+
+// ── Tools ──
+
+async function loadTools() {
+  try {
+    cachedTools = await api('/settings/tools');
+    renderTools();
+  } catch (e) { toast('Failed to load tools: ' + e.message, false); }
+}
+
+function renderTools() {
+  const tb = document.getElementById('tools-body');
+  const keys = Object.keys(cachedTools);
+  document.getElementById('tools-empty').style.display = keys.length ? 'none' : 'block';
+  tb.closest('table').style.display = keys.length ? '' : 'none';
+  tb.innerHTML = keys.sort().map(name => {
+    const tools = cachedTools[name] || [];
+    const tags = tools.map(t => '<span class="tag tag-tool">' + esc(t.name || '?') + '</span>').join(' ');
+    return '<tr><td><strong>' + esc(name) + '</strong></td><td>' + (tags || '<span style="color:#999">none</span>') +
+      '</td><td><span class="refresh-icon" title="Refresh" onclick="refreshTools(\'' + esc(name) + '\')">&#x21bb;</span></td></tr>';
+  }).join('');
+}
+
+async function refreshTools(name) {
+  try {
+    const data = await api('/settings/tools/' + encodeURIComponent(name) + '/refresh', { method: 'POST' });
+    cachedTools[name] = data.tools;
+    renderTools();
+    toast('Refreshed ' + name, true);
+  } catch (e) { toast('Refresh failed: ' + e.message, false); }
+}
+
+async function refreshAllTools() {
+  for (const name of Object.keys(cachedTools)) {
+    await refreshTools(name);
+  }
+}
+
+// ── Profiles ──
+
+async function loadProfiles() {
+  try {
+    const profiles = await api('/settings/profiles');
+    renderProfiles(profiles);
+  } catch (e) { toast('Failed to load profiles: ' + e.message, false); }
+}
+
+function renderProfiles(profiles) {
+  const tb = document.getElementById('profiles-body');
+  document.getElementById('profiles-empty').style.display = profiles.length ? 'none' : 'block';
+  tb.closest('table').style.display = profiles.length ? '' : 'none';
+  tb.innerHTML = profiles.sort((a, b) => a.name.localeCompare(b.name)).map(p => {
+    const toolTags = Object.entries(p.allowed_tools || {}).flatMap(([up, tools]) =>
+      tools.map(t => '<span class="tag tag-tool">' + esc(up) + '/' + esc(t) + '</span>')
+    ).join(' ');
+    return '<tr><td><strong>' + esc(p.name) + '</strong></td>' +
+      '<td><code>/' + esc(p.name) + '/&lt;upstream&gt;/…</code></td>' +
+      '<td>' + (toolTags || '<span style="color:#999">none</span>') + '</td>' +
+      '<td><div class="actions">' +
+        '<button class="btn btn-sm" onclick="openEditProfile(\'' + esc(p.name) + '\')">Edit</button>' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteProfile(\'' + esc(p.name) + '\')">Delete</button>' +
+      '</div></td></tr>';
+  }).join('');
+}
+
+async function deleteProfile(name) {
+  if (!confirm('Delete profile "' + name + '"?')) return;
+  try {
+    await api('/settings/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+    toast('Deleted ' + name, true);
+    loadProfiles();
+  } catch (e) { toast('Delete failed: ' + e.message, false); }
+}
+
+// ── Modal ──
+
+function openCreateProfile() {
+  editingProfile = null;
+  document.getElementById('modal-title').textContent = 'New Profile';
+  document.getElementById('modal-save').textContent = 'Create';
+  document.getElementById('profile-name').value = '';
+  document.getElementById('profile-name').disabled = false;
+  renderToolPicker({});
+  document.getElementById('profile-overlay').classList.add('open');
+}
+
+async function openEditProfile(name) {
+  try {
+    const profile = await api('/settings/profiles/' + encodeURIComponent(name));
+    editingProfile = name;
+    document.getElementById('modal-title').textContent = 'Edit Profile';
+    document.getElementById('modal-save').textContent = 'Save';
+    document.getElementById('profile-name').value = profile.name;
+    document.getElementById('profile-name').disabled = true;
+    renderToolPicker(profile.allowed_tools || {});
+    document.getElementById('profile-overlay').classList.add('open');
+  } catch (e) { toast('Failed to load profile: ' + e.message, false); }
+}
+
+function closeModal() {
+  document.getElementById('profile-overlay').classList.remove('open');
+}
+
+function renderToolPicker(selected) {
+  const picker = document.getElementById('tool-picker');
+  const upstreams = Object.keys(cachedTools).sort();
+  if (!upstreams.length) {
+    picker.innerHTML = '<div class="empty">No tools cached yet — refresh upstreams first</div>';
+    return;
+  }
+  picker.innerHTML = upstreams.map(name => {
+    const tools = cachedTools[name] || [];
+    const sel = selected[name] || [];
+    const allChecked = tools.length > 0 && tools.every(t => sel.includes(t.name));
+    return '<div class="tool-picker-group">' +
+      '<div class="tool-picker-group-header"><label><input type="checkbox" data-upstream="' + esc(name) + '" class="upstream-toggle"' +
+        (allChecked ? ' checked' : '') + ' onchange="toggleUpstream(this)"> ' + esc(name) + ' (' + tools.length + ')</label></div>' +
+      tools.map(t =>
+        '<div class="tool-item"><label><input type="checkbox" data-upstream="' + esc(name) + '" data-tool="' + esc(t.name) + '"' +
+          (sel.includes(t.name) ? ' checked' : '') + '> ' + esc(t.name) + '</label></div>'
+      ).join('') +
+      '</div>';
+  }).join('');
+}
+
+function toggleUpstream(el) {
+  const name = el.dataset.upstream;
+  const checked = el.checked;
+  document.querySelectorAll('#tool-picker input[data-upstream="' + name + '"][data-tool]').forEach(cb => cb.checked = checked);
+}
+
+function getSelectedTools() {
+  const result = {};
+  document.querySelectorAll('#tool-picker input[data-tool]:checked').forEach(cb => {
+    const up = cb.dataset.upstream;
+    if (!result[up]) result[up] = [];
+    result[up].push(cb.dataset.tool);
+  });
+  return result;
+}
+
+async function saveProfile() {
+  const name = document.getElementById('profile-name').value.trim();
+  if (!name) { toast('Profile name is required', false); return; }
+  const allowed_tools = getSelectedTools();
+  const body = JSON.stringify({ name, allowed_tools });
+  const headers = { 'Content-Type': 'application/json' };
+  try {
+    if (editingProfile) {
+      await api('/settings/profiles/' + encodeURIComponent(editingProfile), { method: 'PUT', headers, body });
+    } else {
+      await api('/settings/profiles', { method: 'POST', headers, body });
+    }
+    toast((editingProfile ? 'Updated ' : 'Created ') + name, true);
+    closeModal();
+    loadProfiles();
+  } catch (e) { toast('Save failed: ' + e.message, false); }
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── MCP Servers ──
+
+let editingServer = null;
+
+async function loadServers() {
+  try {
+    const servers = await api('/settings/servers');
+    renderServers(servers);
+  } catch (e) { toast('Failed to load servers: ' + e.message, false); }
+}
+
+function renderServers(servers) {
+  const tb = document.getElementById('servers-body');
+  document.getElementById('servers-empty').style.display = servers.length ? 'none' : 'block';
+  tb.closest('table').style.display = servers.length ? '' : 'none';
+  tb.innerHTML = servers.sort((a, b) => a.name.localeCompare(b.name)).map(s => {
+    const authInfo = (s.auth_prefix ? esc(s.auth_prefix) + ' ' : '') + '<code>' + esc(s.auth_header) + '</code>';
+    const source = s.from_config ? ' <span class="tag">config</span>' : '';
+    const actions = s.from_config
+      ? '<span style="color:#999;font-size:12px">from config</span>'
+      : '<div class="actions">' +
+          '<button class="btn btn-sm" onclick="openEditServer(\'' + esc(s.name) + '\')">Edit</button>' +
+          '<button class="btn btn-sm btn-danger" onclick="deleteServer(\'' + esc(s.name) + '\')">Delete</button>' +
+        '</div>';
+    const urlDisplay = s.url ? '<code>' + esc(s.url) + '</code>' : '<span style="color:#999">' + esc(s.transport) + '</span>';
+    return '<tr><td><strong>' + esc(s.name) + '</strong>' + source + '</td>' +
+      '<td>' + urlDisplay + '</td>' +
+      '<td>' + authInfo + '</td>' +
+      '<td>' + actions + '</td></tr>';
+  }).join('');
+}
+
+function openCreateServer() {
+  editingServer = null;
+  document.getElementById('server-modal-title').textContent = 'Add MCP Server';
+  document.getElementById('server-modal-save').textContent = 'Add';
+  document.getElementById('server-name').value = '';
+  document.getElementById('server-name').disabled = false;
+  document.getElementById('server-url').value = '';
+  document.getElementById('server-auth-header').value = 'Authorization';
+  document.getElementById('server-auth-prefix').value = '';
+  document.getElementById('server-credential-ref').value = '';
+  document.getElementById('server-overlay').classList.add('open');
+}
+
+async function openEditServer(name) {
+  try {
+    const server = await api('/settings/servers/' + encodeURIComponent(name));
+    editingServer = name;
+    document.getElementById('server-modal-title').textContent = 'Edit MCP Server';
+    document.getElementById('server-modal-save').textContent = 'Save';
+    document.getElementById('server-name').value = server.name;
+    document.getElementById('server-name').disabled = true;
+    document.getElementById('server-url').value = server.url;
+    document.getElementById('server-auth-header').value = server.auth_header || 'Authorization';
+    document.getElementById('server-auth-prefix').value = server.auth_prefix || '';
+    document.getElementById('server-credential-ref').value = server.credential_ref;
+    document.getElementById('server-overlay').classList.add('open');
+  } catch (e) { toast('Failed to load server: ' + e.message, false); }
+}
+
+function closeServerModal() {
+  document.getElementById('server-overlay').classList.remove('open');
+}
+
+async function saveServer() {
+  const name = document.getElementById('server-name').value.trim();
+  const url = document.getElementById('server-url').value.trim();
+  const auth_header = document.getElementById('server-auth-header').value.trim() || 'Authorization';
+  const auth_prefix = document.getElementById('server-auth-prefix').value.trim() || null;
+  const credential_ref = document.getElementById('server-credential-ref').value.trim();
+
+  if (!name) { toast('Server name is required', false); return; }
+  if (!url) { toast('URL is required', false); return; }
+  if (!credential_ref) { toast('Credential reference is required', false); return; }
+
+  const body = JSON.stringify({ name, url, auth_header, auth_prefix, credential_ref });
+  const headers = { 'Content-Type': 'application/json' };
+  try {
+    if (editingServer) {
+      await api('/settings/servers/' + encodeURIComponent(editingServer), { method: 'PUT', headers, body });
+    } else {
+      await api('/settings/servers', { method: 'POST', headers, body });
+    }
+    toast((editingServer ? 'Updated ' : 'Added ') + name, true);
+    closeServerModal();
+    loadServers();
+    // Reload tools since the new server is now a live upstream
+    loadTools();
+  } catch (e) { toast('Save failed: ' + e.message, false); }
+}
+
+async function deleteServer(name) {
+  if (!confirm('Delete MCP server "' + name + '"?')) return;
+  try {
+    await api('/settings/servers/' + encodeURIComponent(name), { method: 'DELETE' });
+    toast('Deleted ' + name, true);
+    loadServers();
+    loadTools();
+  } catch (e) { toast('Delete failed: ' + e.message, false); }
+}
+
+// ── Init ──
+loadTools().then(() => { loadProfiles(); loadServers(); });
+</script>
+</body>
+</html>

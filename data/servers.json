@@ -1,0 +1,9 @@
+[
+  {
+    "name": "context72",
+    "url": "https://mcp.context7.com/mcp",
+    "auth_header": "CONTEXT7_API_KEY",
+    "auth_prefix": null,
+    "credential_ref": "op://Private/Context7/API-Key"
+  }
+]

@@ -22,6 +22,12 @@ header = "Authorization"
 prefix = "Bearer"
 credential_ref = "op://Private/example-api/token"
 
+# Extra headers injected alongside the primary auth header:
+# [[upstream.auth.extra_headers]]
+# header = "X-Custom-Key"
+# prefix = "Token"                         # optional
+# credential_ref = "op://Private/example-api/custom-key"
+
 # [[upstream]]
 # name = "local-server"
 # path_prefix = "/local"

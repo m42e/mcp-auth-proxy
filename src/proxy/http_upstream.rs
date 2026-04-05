@@ -28,11 +28,14 @@ impl HttpUpstream {
         Ok(Self { client, base_url })
     }
 
+    pub fn url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn forward(
         &self,
         request: Request<Body>,
-        auth_header_name: &str,
-        auth_header_value: &str,
+        auth_headers: &[(String, String)],
     ) -> Result<Response> {
         let method = request.method().clone();
         let path = request.uri().path();
@@ -66,8 +69,10 @@ impl HttpUpstream {
             }
         }
 
-        // Inject auth header
-        upstream_req = upstream_req.header(auth_header_name, auth_header_value);
+        // Inject auth headers
+        for (name, value) in auth_headers {
+            upstream_req = upstream_req.header(name.as_str(), value.as_str());
+        }
 
         // Forward body
         let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
@@ -153,8 +158,7 @@ impl HttpUpstream {
     ///   3. tools/list  → extract tools
     pub async fn fetch_tools(
         &self,
-        auth_header_name: &str,
-        auth_header_value: &str,
+        auth_headers: &[(String, String)],
     ) -> Result<Vec<Value>> {
         // Step 1: initialize
         let init_body = serde_json::json!({
@@ -171,12 +175,15 @@ impl HttpUpstream {
             }
         });
 
-        let init_resp = self
+        let mut init_req = self
             .client
             .post(&self.base_url)
-            .header(auth_header_name, auth_header_value)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "application/json, text/event-stream");
+        for (name, value) in auth_headers {
+            init_req = init_req.header(name.as_str(), value.as_str());
+        }
+        let init_resp = init_req
             .json(&init_body)
             .send()
             .await
@@ -211,9 +218,11 @@ impl HttpUpstream {
         let mut notif_req = self
             .client
             .post(&self.base_url)
-            .header(auth_header_name, auth_header_value)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
+        for (name, value) in auth_headers {
+            notif_req = notif_req.header(name.as_str(), value.as_str());
+        }
 
         if let Some(ref sid) = session_id {
             notif_req = notif_req.header("Mcp-Session-Id", sid);
@@ -242,9 +251,11 @@ impl HttpUpstream {
         let mut tools_req = self
             .client
             .post(&self.base_url)
-            .header(auth_header_name, auth_header_value)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
+        for (name, value) in auth_headers {
+            tools_req = tools_req.header(name.as_str(), value.as_str());
+        }
 
         if let Some(ref sid) = session_id {
             tools_req = tools_req.header("Mcp-Session-Id", sid);

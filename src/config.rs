@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +69,18 @@ pub struct AuthConfig {
     pub credential_ref: Option<String>,
     /// OAuth configuration (for oauth auth)
     pub oauth: Option<OAuthConfig>,
+    /// Additional headers to inject, each resolved via the credential provider
+    #[serde(default)]
+    pub extra_headers: Vec<ExtraHeader>,
+}
+
+/// An additional header to inject, resolved via the credential provider.
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct ExtraHeader {
+    pub header: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    pub credential_ref: String,
 }
 
 fn default_auth_header() -> String {

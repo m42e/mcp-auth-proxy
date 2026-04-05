@@ -148,8 +148,7 @@ impl StdioUpstream {
     pub async fn forward(
         &self,
         request: Request<Body>,
-        _auth_header_name: &str,
-        _auth_header_value: &str,
+        _auth_headers: &[(String, String)],
     ) -> Result<Response> {
         self.ensure_process().await?;
 

@@ -112,12 +112,64 @@ async fn main() -> Result<()> {
             auth: auth_strategy,
             http,
             stdio,
+            from_config: true,
+            auth_header: upstream_config.auth.header.clone(),
+            credential_ref: upstream_config.auth.credential_ref.clone(),
         }));
     }
 
     // Create tool cache and profile store
     let tool_cache = tool_cache::ToolCache::new();
-    let profile_store = settings::ProfileStore::new();
+
+    // Derive data directory from config file location
+    let config_dir = std::path::Path::new(&cli.config)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let data_dir = config_dir.join("data");
+    let profile_store = settings::ProfileStore::new(data_dir.join("profiles.json"));
+    let mcp_server_store = settings::McpServerStore::new(data_dir.join("servers.json"));
+
+    // Re-register persisted dynamic MCP servers as upstreams
+    for server in mcp_server_store.list().await {
+        let auth_config = config::AuthConfig {
+            method: config::AuthMethod::Static,
+            header: server.auth_header.clone(),
+            prefix: server.auth_prefix.clone(),
+            credential_ref: Some(server.credential_ref.clone()),
+            oauth: None,
+            extra_headers: server.extra_headers.clone(),
+        };
+        match auth::create_auth_strategy(
+            &auth_config,
+            &server.name,
+            credential_provider.clone(),
+            token_storage.clone(),
+        ) {
+            Ok(auth_strategy) => {
+                match proxy::http_upstream::HttpUpstream::new(server.url.clone()) {
+                    Ok(http) => {
+                        upstreams.push(Arc::new(proxy::UpstreamState {
+                            name: server.name.clone(),
+                            transport: TransportType::Http,
+                            auth: auth_strategy,
+                            http: Some(http),
+                            stdio: None,
+                            from_config: false,
+                            auth_header: server.auth_header.clone(),
+                            credential_ref: Some(server.credential_ref.clone()),
+                        }));
+                        info!(server = %server.name, "restored persisted MCP server");
+                    }
+                    Err(e) => {
+                        error!(server = %server.name, error = %e, "failed to restore persisted MCP server");
+                    }
+                }
+            }
+            Err(e) => {
+                error!(server = %server.name, error = %e, "failed to create auth for persisted MCP server");
+            }
+        }
+    }
 
     // Clone upstreams for background cache refresh
     let upstreams_for_cache: Vec<Arc<proxy::UpstreamState>> =
@@ -125,7 +177,14 @@ async fn main() -> Result<()> {
     let tool_cache_bg = tool_cache.clone();
 
     // Build router
-    let app = proxy::build_router(upstreams, tool_cache, profile_store);
+    let app = proxy::build_router(
+        upstreams,
+        tool_cache,
+        profile_store,
+        mcp_server_store,
+        credential_provider,
+        token_storage,
+    );
 
     // Start server
     let addr = format!("{}:{}", config.server.host, config.server.port);

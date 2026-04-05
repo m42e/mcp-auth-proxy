@@ -487,10 +487,10 @@ impl OAuthAuth {
 
 #[async_trait]
 impl AuthStrategy for OAuthAuth {
-    async fn get_auth_header(&self) -> Result<(String, String)> {
+    async fn get_auth_headers(&self) -> Result<Vec<(String, String)>> {
         let access_token = self.ensure_token().await?;
         let value = format!("Bearer {}", access_token);
-        Ok((self.header_name.clone(), value))
+        Ok(vec![(self.header_name.clone(), value)])
     }
 
     async fn handle_unauthorized(&self) -> Result<()> {
