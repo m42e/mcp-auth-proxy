@@ -2,17 +2,18 @@ mod auth;
 mod config;
 mod credential;
 mod proxy;
+mod settings;
 mod storage;
+mod tool_cache;
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, TransportType};
-use crate::proxy::UpstreamState;
 
 #[derive(Parser)]
 #[command(name = "mcp-auth-proxy")]
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
             TransportType::Http => None,
         };
 
-        upstreams.push(Arc::new(UpstreamState {
+        upstreams.push(Arc::new(proxy::UpstreamState {
             name: upstream_config.path_prefix.trim_start_matches('/').to_string(),
             transport: upstream_config.transport.clone(),
             auth: auth_strategy,
@@ -114,8 +115,17 @@ async fn main() -> Result<()> {
         }));
     }
 
+    // Create tool cache and profile store
+    let tool_cache = tool_cache::ToolCache::new();
+    let profile_store = settings::ProfileStore::new();
+
+    // Clone upstreams for background cache refresh
+    let upstreams_for_cache: Vec<Arc<proxy::UpstreamState>> =
+        upstreams.iter().cloned().collect();
+    let tool_cache_bg = tool_cache.clone();
+
     // Build router
-    let app = proxy::build_router(upstreams);
+    let app = proxy::build_router(upstreams, tool_cache, profile_store);
 
     // Start server
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -124,6 +134,15 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind to {}", addr))?;
 
     info!(addr = %addr, "mcp-auth-proxy listening");
+
+    // Refresh tool cache in the background at startup
+    tokio::spawn(async move {
+        for upstream in &upstreams_for_cache {
+            if let Err(e) = tool_cache_bg.refresh_upstream(upstream).await {
+                warn!(upstream = %upstream.name, error = %e, "failed to cache tools at startup");
+            }
+        }
+    });
 
     axum::serve(listener, app)
         .await

@@ -7,7 +7,8 @@ use axum::{
 use futures_util::StreamExt;
 use http::{header, HeaderName, HeaderValue, Method};
 use reqwest::Client;
-use tracing::debug;
+use serde_json::Value;
+use tracing::{debug, warn};
 
 /// HTTP upstream transport — forwards requests to an HTTP MCP server.
 pub struct HttpUpstream {
@@ -140,5 +141,137 @@ fn convert_method(method: &Method) -> reqwest::Method {
         Method::HEAD => reqwest::Method::HEAD,
         Method::OPTIONS => reqwest::Method::OPTIONS,
         _ => reqwest::Method::GET,
+    }
+}
+
+impl HttpUpstream {
+    /// Fetch the list of tools from the upstream MCP server.
+    ///
+    /// This performs the full MCP session handshake:
+    ///   1. initialize  → capture Mcp-Session-Id
+    ///   2. notifications/initialized
+    ///   3. tools/list  → extract tools
+    pub async fn fetch_tools(
+        &self,
+        auth_header_name: &str,
+        auth_header_value: &str,
+    ) -> Result<Vec<Value>> {
+        // Step 1: initialize
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "mcp-auth-proxy",
+                    "version": "0.1.0"
+                }
+            }
+        });
+
+        let init_resp = self
+            .client
+            .post(&self.base_url)
+            .header(auth_header_name, auth_header_value)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&init_body)
+            .send()
+            .await
+            .context("failed to send initialize request")?;
+
+        let session_id = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let init_result: Value = init_resp
+            .json()
+            .await
+            .context("failed to parse initialize response")?;
+
+        if init_result.get("error").is_some() {
+            anyhow::bail!(
+                "initialize failed: {}",
+                init_result.get("error").unwrap()
+            );
+        }
+
+        debug!(session_id = ?session_id, "MCP session initialized for tool discovery");
+
+        // Step 2: notifications/initialized
+        let notif_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+
+        let mut notif_req = self
+            .client
+            .post(&self.base_url)
+            .header(auth_header_name, auth_header_value)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+
+        if let Some(ref sid) = session_id {
+            notif_req = notif_req.header("Mcp-Session-Id", sid);
+        }
+
+        let notif_resp = notif_req
+            .json(&notif_body)
+            .send()
+            .await
+            .context("failed to send initialized notification")?;
+
+        if !notif_resp.status().is_success() {
+            warn!(
+                status = %notif_resp.status(),
+                "initialized notification returned non-success status"
+            );
+        }
+
+        // Step 3: tools/list
+        let tools_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "id": 2
+        });
+
+        let mut tools_req = self
+            .client
+            .post(&self.base_url)
+            .header(auth_header_name, auth_header_value)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+
+        if let Some(ref sid) = session_id {
+            tools_req = tools_req.header("Mcp-Session-Id", sid);
+        }
+
+        let tools_resp = tools_req
+            .json(&tools_body)
+            .send()
+            .await
+            .context("failed to send tools/list request")?;
+
+        let body: Value = tools_resp
+            .json()
+            .await
+            .context("failed to parse tools/list response")?;
+
+        if body.get("error").is_some() {
+            anyhow::bail!("tools/list failed: {}", body.get("error").unwrap());
+        }
+
+        let tools = body
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(tools)
     }
 }

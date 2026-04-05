@@ -234,3 +234,118 @@ impl Drop for StdioUpstream {
         }
     }
 }
+
+impl StdioUpstream {
+    /// Send a JSON-RPC message and wait for the response.
+    pub async fn send_jsonrpc(&self, msg: &Value) -> Result<Value> {
+        self.ensure_process().await?;
+
+        let request_id = msg
+            .get("id")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("JSON-RPC message must have an id"))?;
+
+        let mut proc_guard = self.process.lock().await;
+        let managed = proc_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("stdio process not available"))?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        managed
+            .pending
+            .write()
+            .await
+            .insert(request_id.clone(), tx);
+
+        let msg_bytes = serde_json::to_vec(msg).context("failed to serialize message")?;
+        managed
+            .stdin
+            .write_all(&msg_bytes)
+            .await
+            .context("failed to write to stdin")?;
+        managed
+            .stdin
+            .write_all(b"\n")
+            .await
+            .context("failed to write newline")?;
+        managed
+            .stdin
+            .flush()
+            .await
+            .context("failed to flush stdin")?;
+
+        drop(proc_guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .context("timeout waiting for response")?
+            .context("reader task dropped")?;
+
+        Ok(response)
+    }
+
+    /// Fetch the list of tools from the upstream MCP server via the full MCP handshake.
+    ///
+    /// Sends initialize → notifications/initialized → tools/list over stdio.
+    pub async fn fetch_tools(&self) -> Result<Vec<Value>> {
+        // Step 1: initialize
+        let init_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 1000001,
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "mcp-auth-proxy",
+                    "version": "0.1.0"
+                }
+            }
+        });
+
+        let init_resp = self.send_jsonrpc(&init_msg).await?;
+        if init_resp.get("error").is_some() {
+            anyhow::bail!("initialize failed: {}", init_resp.get("error").unwrap());
+        }
+
+        // Step 2: notifications/initialized (no id → notification)
+        // We must send this directly since send_jsonrpc expects an id.
+        self.ensure_process().await?;
+        {
+            let mut proc_guard = self.process.lock().await;
+            let managed = proc_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("stdio process not available"))?;
+
+            let notif = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            });
+            let notif_bytes = serde_json::to_vec(&notif)?;
+            managed.stdin.write_all(&notif_bytes).await?;
+            managed.stdin.write_all(b"\n").await?;
+            managed.stdin.flush().await?;
+        }
+
+        // Step 3: tools/list
+        let tools_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "id": 1000002
+        });
+
+        let tools_resp = self.send_jsonrpc(&tools_msg).await?;
+        if tools_resp.get("error").is_some() {
+            anyhow::bail!("tools/list failed: {}", tools_resp.get("error").unwrap());
+        }
+
+        let tools = tools_resp
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(tools)
+    }
+}

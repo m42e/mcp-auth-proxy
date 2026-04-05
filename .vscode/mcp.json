@@ -1,5 +1,5 @@
 {
-	"no_servers": {
+	"servers": {
 		"my-mcp-server-5fc54c9f": {
 			"url": "http://127.0.0.1:3100/context7",
 			"type": "http"
