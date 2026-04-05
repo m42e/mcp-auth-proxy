@@ -1,3 +1,7 @@
+[remote.github]
+owner = "m42e"
+repo = "mcp-auth-proxy"
+
 [changelog]
 header = ""
 body = """
