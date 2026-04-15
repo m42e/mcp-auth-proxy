@@ -18,6 +18,7 @@ use crate::config::{Config, TransportType};
 
 #[derive(Parser)]
 #[command(name = "mcp-auth-proxy")]
+#[command(version)]
 #[command(about = "MCP authentication proxy — forwards requests with injected credentials")]
 struct Cli {
     /// Path to the TOML configuration file
