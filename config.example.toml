@@ -53,8 +53,11 @@ credential_ref = "op://Private/example-api/token"
 # header = "Authorization"
 #
 # [upstream.auth.oauth]
-# server_url = "https://auth.example.com"
+# server_url = "https://auth.example.com" # authorization-server issuer from protected-resource metadata
 # scopes = ["mcp:read", "mcp:write"]
+# client_id = "registered-client-id"      # optional; use when DCR is unavailable
+# client_secret_ref = "op://Private/oauth/client-secret" # optional credential-provider reference
+# token_endpoint_auth_method = "client_secret_basic" # default: none without a secret, basic with one
 # redirect_port = 8765
 # client_name = "mcp-auth-proxy"
 

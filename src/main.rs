@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod credential;
 mod mcp_logging;
+mod mcp_protocol;
 mod proxy;
 mod settings;
 mod storage;
@@ -73,6 +74,17 @@ async fn main() -> Result<()> {
                     Err(e) => error!(upstream = %upstream.name, error = %e, "credential resolution FAILED"),
                 }
             }
+            if let Some(secret_ref) = upstream
+                .auth
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.client_secret_ref.as_deref())
+            {
+                match credential_provider.resolve(secret_ref).await {
+                    Ok(_) => info!(upstream = %upstream.name, "OAuth client-secret resolution OK"),
+                    Err(e) => error!(upstream = %upstream.name, error = %e, "OAuth client-secret resolution FAILED"),
+                }
+            }
         }
         info!("validation complete");
         return Ok(());
@@ -85,6 +97,7 @@ async fn main() -> Result<()> {
         let auth_strategy = auth::create_auth_strategy(
             &upstream_config.auth,
             &upstream_config.name,
+            upstream_config.url.as_deref(),
             credential_provider.clone(),
             token_storage.clone(),
         )?;
@@ -152,6 +165,7 @@ async fn main() -> Result<()> {
         match auth::create_auth_strategy(
             &auth_config,
             &server.name,
+            None,
             credential_provider.clone(),
             token_storage.clone(),
         ) {

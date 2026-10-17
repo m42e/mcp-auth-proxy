@@ -100,6 +100,15 @@ pub enum AuthMethod {
 pub struct OAuthConfig {
     /// The OAuth authorization server URL (used for discovery)
     pub server_url: String,
+    /// Existing OAuth client ID, for authorization servers without DCR.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Credential-provider reference for a confidential client's secret.
+    #[serde(default)]
+    pub client_secret_ref: Option<String>,
+    /// Token endpoint auth method for a pre-registered client.
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     /// Local port for the OAuth callback listener
@@ -223,11 +232,40 @@ impl Config {
                     }
                 }
                 AuthMethod::OAuth => {
+                    if upstream.transport != TransportType::Http {
+                        anyhow::bail!(
+                            "upstream '{}': OAuth authorization requires HTTP transport",
+                            upstream.name
+                        );
+                    }
                     if upstream.auth.oauth.is_none() {
                         anyhow::bail!(
                             "upstream '{}': oauth auth requires [upstream.auth.oauth] section",
                             upstream.name
                         );
+                    }
+                    if let Some(oauth) = upstream.auth.oauth.as_ref() {
+                        if oauth.client_id.is_none()
+                            && (oauth.client_secret_ref.is_some()
+                                || oauth.token_endpoint_auth_method.is_some())
+                        {
+                            anyhow::bail!(
+                                "upstream '{}': client_secret_ref and token_endpoint_auth_method require an OAuth client_id",
+                                upstream.name
+                            );
+                        }
+                        if let Some(method) = oauth.token_endpoint_auth_method.as_deref() {
+                            if !matches!(
+                                method,
+                                "none" | "client_secret_basic" | "client_secret_post"
+                            ) {
+                                anyhow::bail!(
+                                    "upstream '{}': unsupported OAuth token_endpoint_auth_method '{}'",
+                                    upstream.name,
+                                    method
+                                );
+                            }
+                        }
                     }
                 }
             }

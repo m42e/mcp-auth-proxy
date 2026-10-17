@@ -426,6 +426,7 @@ async fn register_dynamic_upstream(
     let auth_strategy = auth::create_auth_strategy(
         &auth_config,
         &server.name,
+        None,
         state.credential_provider.clone(),
         state.token_storage.clone(),
     )?;
@@ -631,20 +632,22 @@ async fn proxy_with_filter(
     }
 }
 
-/// Intercept a tools/list JSON response and update the tool cache.
+/// Intercept a tools/list JSON or SSE response and update the tool cache.
 async fn cache_tools_from_response(
     state: &AppState,
     upstream_name: &str,
     response: Response,
 ) -> Response {
-    let is_json = response
+    let content_type = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.contains("application/json"))
-        .unwrap_or(false);
+        .unwrap_or_default()
+        .to_string();
+    let is_json = content_type.contains("application/json");
+    let is_sse = content_type.contains("text/event-stream");
 
-    if !is_json {
+    if !is_json && !is_sse {
         return response;
     }
 
@@ -654,7 +657,16 @@ async fn cache_tools_from_response(
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
 
-    if let Ok(msg) = serde_json::from_slice::<Value>(&body_bytes) {
+    let messages: Vec<Value> = if is_json {
+        serde_json::from_slice::<Value>(&body_bytes)
+            .ok()
+            .into_iter()
+            .collect()
+    } else {
+        sse_jsonrpc_messages(&body_bytes)
+    };
+
+    for msg in messages {
         if let Some(tools) = msg
             .get("result")
             .and_then(|r| r.get("tools"))
@@ -670,16 +682,18 @@ async fn cache_tools_from_response(
     Response::from_parts(parts, Body::from(body_bytes))
 }
 
-/// Filter a tools/list JSON response to only include allowed tools.
+/// Filter a tools/list JSON or SSE response to only include allowed tools.
 async fn filter_tools_list_response(response: Response, allowed_tools: &[String]) -> Response {
-    let is_json = response
+    let content_type = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.contains("application/json"))
-        .unwrap_or(false);
+        .unwrap_or_default()
+        .to_string();
+    let is_json = content_type.contains("application/json");
+    let is_sse = content_type.contains("text/event-stream");
 
-    if !is_json {
+    if !is_json && !is_sse {
         return response;
     }
 
@@ -689,26 +703,109 @@ async fn filter_tools_list_response(response: Response, allowed_tools: &[String]
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
 
-    if let Ok(mut msg) = serde_json::from_slice::<Value>(&body_bytes) {
-        if let Some(tools) = msg
-            .get_mut("result")
-            .and_then(|r| r.get_mut("tools"))
-            .and_then(|t| t.as_array_mut())
-        {
-            tools.retain(|tool| {
-                tool.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|name| allowed_tools.contains(&name.to_string()))
-                    .unwrap_or(false)
-            });
-
-            if let Ok(filtered_bytes) = serde_json::to_vec(&msg) {
-                return Response::from_parts(parts, Body::from(filtered_bytes));
+    if is_json {
+        if let Ok(mut msg) = serde_json::from_slice::<Value>(&body_bytes) {
+            if filter_tools_in_message(&mut msg, allowed_tools) {
+                if let Ok(filtered_bytes) = serde_json::to_vec(&msg) {
+                    let mut parts = parts;
+                    parts.headers.remove(http::header::CONTENT_LENGTH);
+                    return Response::from_parts(parts, Body::from(filtered_bytes));
+                }
             }
         }
+
+        return Response::from_parts(parts, Body::from(body_bytes));
     }
 
-    Response::from_parts(parts, Body::from(body_bytes))
+    let text = String::from_utf8_lossy(&body_bytes).replace("\r\n", "\n");
+    let mut changed = false;
+    let events = text
+        .split("\n\n")
+        .map(|event| {
+            let mut data_lines = Vec::new();
+            let mut message = None;
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    data_lines.push(data.strip_prefix(' ').unwrap_or(data));
+                }
+            }
+            if !data_lines.is_empty() {
+                message = serde_json::from_str::<Value>(&data_lines.join("\n")).ok();
+            }
+
+            if let Some(mut message) = message {
+                if filter_tools_in_message(&mut message, allowed_tools) {
+                    if let Ok(data) = serde_json::to_string(&message) {
+                        changed = true;
+                        let mut data_written = false;
+                        let lines: Vec<String> = event
+                            .lines()
+                            .filter_map(|line| {
+                                if line.starts_with("data:") {
+                                    if data_written {
+                                        None
+                                    } else {
+                                        data_written = true;
+                                        Some(format!("data: {data}"))
+                                    }
+                                } else {
+                                    Some(line.to_string())
+                                }
+                            })
+                            .collect();
+                        return lines.join("\n");
+                    }
+                }
+            }
+            event.to_string()
+        })
+        .collect::<Vec<_>>();
+
+    if changed {
+        let mut parts = parts;
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+        Response::from_parts(parts, Body::from(events.join("\n\n")))
+    } else {
+        Response::from_parts(parts, Body::from(body_bytes))
+    }
+}
+
+fn filter_tools_in_message(msg: &mut Value, allowed_tools: &[String]) -> bool {
+    if let Some(tools) = msg
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    {
+        let original_len = tools.len();
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|name| allowed_tools.iter().any(|allowed| allowed == name))
+                .unwrap_or(false)
+        });
+        tools.len() != original_len
+    } else {
+        false
+    }
+}
+
+fn sse_jsonrpc_messages(body: &[u8]) -> Vec<Value> {
+    let text = String::from_utf8_lossy(body).replace("\r\n", "\n");
+    text.split("\n\n")
+        .filter_map(|event| {
+            let data = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|line| line.strip_prefix(' ').unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if data.is_empty() {
+                None
+            } else {
+                serde_json::from_str::<Value>(&data).ok()
+            }
+        })
+        .collect()
 }
 
 async fn do_proxy(upstream: &UpstreamState, request: Request<Body>) -> anyhow::Result<Response> {

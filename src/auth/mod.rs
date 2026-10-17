@@ -24,6 +24,7 @@ pub trait AuthStrategy: Send + Sync {
 pub fn create_auth_strategy(
     auth_config: &AuthConfig,
     upstream_name: &str,
+    resource_url: Option<&str>,
     credential_provider: Arc<dyn CredentialProvider>,
     token_storage: Arc<dyn TokenStorage>,
 ) -> Result<Arc<dyn AuthStrategy>> {
@@ -43,15 +44,17 @@ pub fn create_auth_strategy(
             ))
         }
         AuthMethod::OAuth => {
-            let oauth_config = auth_config
-                .oauth
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("oauth auth requires [upstream.auth.oauth] section"))?;
+            let oauth_config = auth_config.oauth.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("oauth auth requires [upstream.auth.oauth] section")
+            })?;
+            let resource_url = resource_url
+                .ok_or_else(|| anyhow::anyhow!("oauth auth requires an HTTP upstream URL"))?;
 
             Arc::new(oauth::OAuthAuth::new(
                 upstream_name.to_string(),
                 auth_config.header.clone(),
                 oauth_config,
+                resource_url.to_string(),
                 credential_provider.clone(),
                 token_storage,
             )?)
