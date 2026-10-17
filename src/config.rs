@@ -132,15 +132,23 @@ pub enum CredentialProviderConfig {
         password_env: String,
         key_file: Option<PathBuf>,
     },
+    #[serde(rename = "aws_secrets_manager")]
+    AwsSecretsManager {
+        /// Optional AWS region override. Falls back to the standard AWS region chain.
+        region: Option<String>,
+        /// Optional AWS profile override. Falls back to the standard AWS profile chain.
+        profile: Option<String>,
+    },
 }
 
 fn default_keepass_password_env() -> String {
     "KEEPASS_PASSWORD".to_string()
 }
 
-// OnePassword and Bitwarden are configured via environment variables:
+// OnePassword, Bitwarden, and AWS Secrets Manager are configured via external auth flows:
 // - 1Password: OP_SERVICE_ACCOUNT_TOKEN or interactive `op` CLI
 // - Bitwarden: BW_SESSION / BW_CLIENTID + BW_CLIENTSECRET env vars
+// - AWS Secrets Manager: default AWS credential chain (env, profile, SSO/OIDC, web identity, etc.)
 
 #[derive(Debug, Deserialize)]
 pub struct TokenStorageConfig {

@@ -1,3 +1,4 @@
+pub mod aws_secrets_manager;
 pub mod bitwarden;
 pub mod keepass_provider;
 pub mod onepassword;
@@ -32,5 +33,8 @@ pub fn create_provider(config: &CredentialProviderConfig) -> Result<Box<dyn Cred
             password_env.clone(),
             key_file.clone(),
         ))),
+        CredentialProviderConfig::AwsSecretsManager { region, profile } => Ok(Box::new(
+            aws_secrets_manager::AwsSecretsManagerProvider::new(region.clone(), profile.clone()),
+        )),
     }
 }

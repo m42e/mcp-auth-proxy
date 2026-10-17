@@ -36,6 +36,10 @@ sha2 = "0.10"
 # KeePass
 keepass = "0.7"
 
+# AWS Secrets Manager
+aws-config = "1"
+aws-sdk-secretsmanager = "1"
+
 # Misc
 url = "2"
 dirs = "6"

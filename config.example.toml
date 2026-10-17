@@ -59,7 +59,7 @@ credential_ref = "op://Private/example-api/token"
 # client_name = "mcp-auth-proxy"
 
 # ── Credential Provider ──────────────────────────────────────────────
-# Choose one: "onepassword", "bitwarden", or "keepass"
+# Choose one: "onepassword", "bitwarden", "keepass", or "aws_secrets_manager"
 
 [credential_provider]
 type = "onepassword"
@@ -77,6 +77,18 @@ type = "onepassword"
 # database_path = "/path/to/passwords.kdbx"
 # password_env = "KEEPASS_PASSWORD"
 # key_file = "/path/to/keyfile"  # optional
+
+# [credential_provider]
+# type = "aws_secrets_manager"
+# region = "eu-central-1"        # optional; otherwise AWS region chain is used
+# profile = "my-oidc-profile"    # optional; otherwise AWS profile chain is used
+#
+# References:
+# - "my/secret/name" returns the full secret string
+# - "my/secret/name#token" extracts the "token" field from a JSON secret
+#
+# Authentication uses the standard AWS credential chain, so existing OIDC/SSO logins
+# such as `aws sso login` or web identity environment variables are reused.
 
 # ── Token Storage ────────────────────────────────────────────────────
 # Used for OAuth refresh tokens and DCR client credentials.
