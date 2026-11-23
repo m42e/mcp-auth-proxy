@@ -140,6 +140,8 @@ async fn main() -> Result<()> {
             stdio,
             from_config: true,
             auth_header: upstream_config.auth.header.clone(),
+            auth_prefix: upstream_config.auth.prefix.clone(),
+            extra_headers: upstream_config.auth.extra_headers.clone(),
             credential_ref: upstream_config.auth.credential_ref.clone(),
             log_mcp_traffic: upstream_config.log_mcp_traffic,
         }));
@@ -158,48 +160,17 @@ async fn main() -> Result<()> {
 
     // Re-register persisted dynamic MCP servers as upstreams
     for server in mcp_server_store.list().await {
-        let auth_config = config::AuthConfig {
-            method: config::AuthMethod::Static,
-            header: server.auth_header.clone(),
-            prefix: server.auth_prefix.clone(),
-            credential_ref: Some(server.credential_ref.clone()),
-            oauth: None,
-            extra_headers: server.extra_headers.clone(),
-        };
-        match auth::create_auth_strategy(
-            &auth_config,
-            &server.name,
-            None,
+        match proxy::build_dynamic_upstream(
+            &server,
             credential_provider.clone(),
             token_storage.clone(),
         ) {
-            Ok(auth_strategy) => {
-                match proxy::http_upstream::HttpUpstream::new(
-                    server.name.clone(),
-                    server.url.clone(),
-                    server.log_mcp_traffic,
-                ) {
-                    Ok(http) => {
-                        upstreams.push(Arc::new(proxy::UpstreamState {
-                            name: server.name.clone(),
-                            transport: TransportType::Http,
-                            auth: auth_strategy,
-                            http: Some(http),
-                            stdio: None,
-                            from_config: false,
-                            auth_header: server.auth_header.clone(),
-                            credential_ref: Some(server.credential_ref.clone()),
-                            log_mcp_traffic: server.log_mcp_traffic,
-                        }));
-                        info!(server = %server.name, "restored persisted MCP server");
-                    }
-                    Err(e) => {
-                        error!(server = %server.name, error = %e, "failed to restore persisted MCP server");
-                    }
-                }
+            Ok(upstream) => {
+                upstreams.push(upstream);
+                info!(server = %server.name, "restored persisted MCP server");
             }
             Err(e) => {
-                error!(server = %server.name, error = %e, "failed to create auth for persisted MCP server");
+                error!(server = %server.name, error = %e, "failed to restore persisted MCP server");
             }
         }
     }

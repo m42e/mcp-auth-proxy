@@ -2,9 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::warn;
+
+use crate::config::{default_auth_header, ExtraHeader};
+use crate::storage::write_private_atomic;
 
 /// A profile that limits tool access under a URL prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,23 +43,27 @@ impl ProfileStore {
         self.profiles.read().await.get(name).cloned()
     }
 
-    pub async fn upsert(&self, profile: Profile) {
+    pub async fn upsert(&self, profile: Profile) -> anyhow::Result<()> {
         let mut profiles = self.profiles.write().await;
-        profiles.insert(profile.name.clone(), profile);
-        persist_json(&self.path, &profiles);
+        let mut next = profiles.clone();
+        next.insert(profile.name.clone(), profile);
+        persist_json(&self.path, &next).await?;
+        *profiles = next;
+        Ok(())
     }
 
-    pub async fn delete(&self, name: &str) -> bool {
+    pub async fn delete(&self, name: &str) -> anyhow::Result<bool> {
         let mut profiles = self.profiles.write().await;
-        let removed = profiles.remove(name).is_some();
-        if removed {
-            persist_json(&self.path, &profiles);
+        if !profiles.contains_key(name) {
+            return Ok(false);
         }
-        removed
+        let mut next = profiles.clone();
+        next.remove(name);
+        persist_json(&self.path, &next).await?;
+        *profiles = next;
+        Ok(true)
     }
 }
-
-use crate::config::ExtraHeader;
 
 /// Configuration for an MCP server added via the settings UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,10 +80,6 @@ pub struct McpServerConfig {
     /// Additional headers to inject, each resolved via the credential provider
     #[serde(default)]
     pub extra_headers: Vec<ExtraHeader>,
-}
-
-fn default_auth_header() -> String {
-    "Authorization".to_string()
 }
 
 /// Persistent store for dynamically added MCP server configurations, backed by a JSON file.
@@ -102,19 +106,25 @@ impl McpServerStore {
         self.servers.read().await.get(name).cloned()
     }
 
-    pub async fn upsert(&self, config: McpServerConfig) {
+    pub async fn upsert(&self, config: McpServerConfig) -> anyhow::Result<()> {
         let mut servers = self.servers.write().await;
-        servers.insert(config.name.clone(), config);
-        persist_json(&self.path, &servers);
+        let mut next = servers.clone();
+        next.insert(config.name.clone(), config);
+        persist_json(&self.path, &next).await?;
+        *servers = next;
+        Ok(())
     }
 
-    pub async fn delete(&self, name: &str) -> bool {
+    pub async fn delete(&self, name: &str) -> anyhow::Result<bool> {
         let mut servers = self.servers.write().await;
-        let removed = servers.remove(name).is_some();
-        if removed {
-            persist_json(&self.path, &servers);
+        if !servers.contains_key(name) {
+            return Ok(false);
         }
-        removed
+        let mut next = servers.clone();
+        next.remove(name);
+        persist_json(&self.path, &next).await?;
+        *servers = next;
+        Ok(true)
     }
 }
 
@@ -140,23 +150,12 @@ where
     }
 }
 
-/// Persist a HashMap of items to a JSON file (array of values).
-fn persist_json<T: Serialize>(path: &Path, map: &HashMap<String, T>) {
+/// Persist a HashMap of items to a JSON file atomically with private permissions.
+async fn persist_json<T: Serialize>(path: &Path, map: &HashMap<String, T>) -> anyhow::Result<()> {
     let items: Vec<&T> = map.values().collect();
-    match serde_json::to_string_pretty(&items) {
-        Ok(data) => {
-            if let Some(parent) = path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    warn!(path = %parent.display(), error = %e, "failed to create data directory");
-                    return;
-                }
-            }
-            if let Err(e) = std::fs::write(path, data) {
-                warn!(path = %path.display(), error = %e, "failed to persist data");
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to serialize data for persistence");
-        }
-    }
+    let data = serde_json::to_vec_pretty(&items).context("failed to serialize persisted data")?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_private_atomic(&path, &data))
+        .await
+        .context("persistence write task panicked")?
 }

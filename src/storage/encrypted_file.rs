@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aes_gcm::{
@@ -14,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use super::TokenStorage;
+use super::{create_private_new, ensure_private_dir, write_private_atomic, TokenStorage};
 
 const FILE_MAGIC_V2: &[u8; 8] = b"MCPTOK2\0";
 const DEFAULT_TOKEN_KEY_ENV: &str = "MCP_AUTH_PROXY_TOKEN_KEY";
@@ -246,75 +245,10 @@ fn derive_legacy_machine_key() -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn ensure_private_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| {
-        format!(
-            "failed to create token storage directory: {}",
-            dir.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
-            || format!("failed to set permissions on directory: {}", dir.display()),
-        )?;
-    }
-    Ok(())
-}
-
-fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    ensure_private_dir(parent)?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("tokens.enc");
-    let tmp_path = parent.join(format!(".{file_name}.tmp.{:016x}", rand::random::<u64>()));
-
-    if let Err(err) = create_private_new(&tmp_path, bytes) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "failed to write temporary token file: {}",
-                tmp_path.display()
-            )
-        });
-    }
-
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err)
-            .with_context(|| format!("failed to replace token file: {}", path.display()));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        derive_legacy_machine_key, write_private_atomic, EncryptedFileStorage, FILE_MAGIC_V2,
-    };
-    use crate::storage::TokenStorage;
+    use super::{derive_legacy_machine_key, EncryptedFileStorage, FILE_MAGIC_V2};
+    use crate::storage::{write_private_atomic, TokenStorage};
     use aes_gcm::{
         aead::{Aead, KeyInit},
         Aes256Gcm, Nonce,

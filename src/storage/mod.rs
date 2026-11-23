@@ -1,6 +1,7 @@
 pub mod encrypted_file;
 pub mod keychain;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -79,6 +80,62 @@ fn default_encrypted_file_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("mcp-auth-proxy")
         .join("tokens.enc")
+}
+
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
+    use anyhow::Context;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
+            || format!("failed to set permissions on directory: {}", dir.display()),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use anyhow::Context;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_dir(parent)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("data.tmp");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{:016x}", rand::random::<u64>()));
+
+    if let Err(err) = create_private_new(&tmp_path, bytes) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err)
+            .with_context(|| format!("failed to write temporary file: {}", tmp_path.display()));
+    }
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("failed to replace file: {}", path.display()));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

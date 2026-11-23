@@ -85,7 +85,7 @@ pub struct ExtraHeader {
     pub credential_ref: String,
 }
 
-fn default_auth_header() -> String {
+pub(crate) fn default_auth_header() -> String {
     "Authorization".to_string()
 }
 
@@ -199,6 +199,7 @@ pub struct EncryptedFileConfig {
 
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
+        let mut prefixes = std::collections::HashSet::new();
         for upstream in &self.upstreams {
             if !upstream.path_prefix.starts_with('/') {
                 anyhow::bail!(
@@ -206,12 +207,50 @@ impl Config {
                     upstream.name
                 );
             }
+            let route = upstream.path_prefix.trim_start_matches('/');
+            if route.is_empty()
+                || route.contains('/')
+                || route == "settings"
+                || route == "."
+                || route == ".."
+                || !route
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+            {
+                anyhow::bail!(
+                    "upstream '{}': path_prefix '{}' must be a single valid route segment and cannot be 'settings'",
+                    upstream.name,
+                    upstream.path_prefix
+                );
+            }
+            if !prefixes.insert(route) {
+                anyhow::bail!(
+                    "duplicate path_prefix '{}' in upstream '{}'",
+                    upstream.path_prefix,
+                    upstream.name
+                );
+            }
             match upstream.transport {
                 TransportType::Http => {
-                    if upstream.url.is_none() {
+                    let Some(ref raw_url) = upstream.url else {
                         anyhow::bail!(
                             "upstream '{}': HTTP transport requires 'url' field",
                             upstream.name
+                        );
+                    };
+                    let parsed = url::Url::parse(raw_url).map_err(|e| {
+                        anyhow::anyhow!(
+                            "upstream '{}': invalid url '{}': {}",
+                            upstream.name,
+                            raw_url,
+                            e
+                        )
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                        anyhow::bail!(
+                            "upstream '{}': url '{}' must use http or https with a host",
+                            upstream.name,
+                            raw_url
                         );
                     }
                 }
@@ -273,18 +312,72 @@ impl Config {
             }
         }
 
-        // Check for duplicate path prefixes
-        let mut prefixes = std::collections::HashSet::new();
-        for upstream in &self.upstreams {
-            if !prefixes.insert(&upstream.path_prefix) {
-                anyhow::bail!(
-                    "duplicate path_prefix '{}' in upstream '{}'",
-                    upstream.path_prefix,
-                    upstream.name
-                );
-            }
-        }
-
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn rejects_multi_segment_and_reserved_path_prefixes() {
+        let multi: Config = toml::from_str(
+            r#"
+            [server]
+            [[upstream]]
+            name = "a"
+            path_prefix = "/a/b"
+            url = "https://example.com"
+            [upstream.auth]
+            method = "static"
+            credential_ref = "op://v/i/f"
+            [credential_provider]
+            type = "onepassword"
+            "#,
+        )
+        .unwrap();
+        assert!(multi.validate().is_err());
+
+        let reserved: Config = toml::from_str(
+            r#"
+            [server]
+            [[upstream]]
+            name = "a"
+            path_prefix = "/settings"
+            url = "https://example.com"
+            [upstream.auth]
+            method = "static"
+            credential_ref = "op://v/i/f"
+            [credential_provider]
+            type = "onepassword"
+            "#,
+        )
+        .unwrap();
+        assert!(reserved.validate().is_err());
+
+        let dup: Config = toml::from_str(
+            r#"
+            [server]
+            [[upstream]]
+            name = "a"
+            path_prefix = "/foo"
+            url = "https://example.com"
+            [upstream.auth]
+            method = "static"
+            credential_ref = "op://v/i/f"
+            [[upstream]]
+            name = "b"
+            path_prefix = "//foo"
+            url = "https://example.com"
+            [upstream.auth]
+            method = "static"
+            credential_ref = "op://v/i/f"
+            [credential_provider]
+            type = "onepassword"
+            "#,
+        )
+        .unwrap();
+        assert!(dup.validate().is_err());
     }
 }
