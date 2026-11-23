@@ -292,6 +292,8 @@ impl Config {
                         );
                     }
                     if let Some(oauth) = upstream.auth.oauth.as_ref() {
+                        crate::auth::oauth::validate_issuer_url(&oauth.server_url)
+                            .map_err(|e| anyhow::anyhow!("upstream '{}': {}", upstream.name, e))?;
                         if oauth.client_id.is_none()
                             && (oauth.client_secret_ref.is_some()
                                 || oauth.token_endpoint_auth_method.is_some())

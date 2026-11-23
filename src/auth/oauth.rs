@@ -9,7 +9,7 @@ use oauth2::{
     RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use super::AuthStrategy;
@@ -18,6 +18,8 @@ use crate::credential::CredentialProvider;
 use crate::storage::TokenStorage;
 
 const TOKEN_EXPIRY_BUFFER: Duration = Duration::from_secs(300); // 5 minutes
+const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
 
 /// OAuth 2.1 authentication with Dynamic Client Registration (DCR) and PKCE.
 pub struct OAuthAuth {
@@ -28,6 +30,7 @@ pub struct OAuthAuth {
     http_client: reqwest::Client,
     credential_provider: Arc<dyn CredentialProvider>,
     token_storage: Arc<dyn TokenStorage>,
+    refresh_lock: Mutex<()>,
     state: RwLock<OAuthState>,
 }
 
@@ -115,6 +118,7 @@ impl OAuthAuth {
         token_storage: Arc<dyn TokenStorage>,
     ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .context("failed to create HTTP client for OAuth")?;
@@ -127,6 +131,7 @@ impl OAuthAuth {
             http_client,
             credential_provider,
             token_storage,
+            refresh_lock: Mutex::new(()),
             state: RwLock::new(OAuthState {
                 metadata: None,
                 client_credentials: None,
@@ -201,6 +206,7 @@ impl OAuthAuth {
                 last_error.unwrap_or_else(|| "no supported metadata endpoint found".to_string())
             )
         })?;
+        validate_server_metadata_endpoints(&metadata)?;
         metadata.resource_scopes = resource_scopes;
         metadata.resource_identifier = resource_identifier;
 
@@ -353,12 +359,14 @@ impl OAuthAuth {
         let token_endpoint_auth_method = dcr_resp
             .token_endpoint_auth_method
             .unwrap_or_else(|| "none".to_string());
+        let client_secret = (token_endpoint_auth_method != "none")
+            .then_some(dcr_resp.client_secret)
+            .flatten();
+        validate_token_endpoint_auth_method(&token_endpoint_auth_method, client_secret.is_some())?;
 
         let creds = ClientCredentials {
             client_id: dcr_resp.client_id,
-            client_secret: (token_endpoint_auth_method != "none")
-                .then_some(dcr_resp.client_secret)
-                .flatten(),
+            client_secret,
             token_endpoint_auth_method,
         };
 
@@ -383,19 +391,11 @@ impl OAuthAuth {
     ) -> Result<(String, Option<String>, Option<Duration>)> {
         let redirect_uri = format!("http://127.0.0.1:{}/callback", self.config.redirect_port);
 
-        let mut client_builder = BasicClient::new(ClientId::new(client_creds.client_id.clone()))
+        let client_builder = BasicClient::new(ClientId::new(client_creds.client_id.clone()))
             .set_auth_uri(AuthUrl::new(metadata.authorization_endpoint.clone())?)
             .set_token_uri(TokenUrl::new(metadata.token_endpoint.clone())?)
             .set_redirect_uri(RedirectUrl::new(redirect_uri)?);
-
-        if let Some(ref secret) = client_creds.client_secret {
-            client_builder = client_builder.set_client_secret(ClientSecret::new(secret.clone()));
-        }
-        if client_creds.token_endpoint_auth_method == "client_secret_post" {
-            client_builder = client_builder.set_auth_type(AuthType::RequestBody);
-        }
-
-        let client = client_builder;
+        let client = apply_client_credentials(client_builder, client_creds);
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -422,7 +422,7 @@ impl OAuthAuth {
             eprintln!("====================================\n");
         }
 
-        let callback = Self::wait_for_callback(callback_listener).await?;
+        let callback = Self::wait_for_callback(callback_listener, OAUTH_CALLBACK_TIMEOUT).await?;
 
         if let Some(response_issuer) = callback.iss.as_deref() {
             if response_issuer != metadata.issuer {
@@ -440,8 +440,8 @@ impl OAuthAuth {
             .state
             .ok_or_else(|| anyhow::anyhow!("OAuth callback missing 'state' parameter"))?;
 
-        // Verify CSRF state
-        if received_state != *csrf_state.secret() {
+        // Verify CSRF state in constant time
+        if !constant_time_eq(received_state.as_bytes(), csrf_state.secret().as_bytes()) {
             anyhow::bail!("OAuth CSRF state mismatch — possible attack");
         }
 
@@ -484,83 +484,139 @@ impl OAuthAuth {
             .with_context(|| format!("failed to bind OAuth callback listener on port {port}"))
     }
 
-    /// Listen for the OAuth callback on a local port.
-    async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<CallbackResponse> {
+    /// Listen for the OAuth callback on a local port until `/callback` arrives or timeout expires.
+    async fn wait_for_callback(
+        listener: tokio::net::TcpListener,
+        timeout: Duration,
+    ) -> Result<CallbackResponse> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         debug!("waiting for OAuth callback");
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        let (mut stream, _addr) = listener
-            .accept()
-            .await
-            .context("failed to accept OAuth callback connection")?;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("timed out waiting for OAuth callback"))?;
 
-        let mut buf = vec![0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .context("failed to read OAuth callback")?;
+            let (mut stream, _addr) = tokio::time::timeout(remaining, listener.accept())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for OAuth callback"))?
+                .context("failed to accept OAuth callback connection")?;
 
-        let request = String::from_utf8_lossy(&buf[..n]);
+            let mut buf = Vec::with_capacity(2048);
+            let mut chunk = [0u8; 1024];
+            let read_res = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let n = stream.read(&mut chunk).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    if buf.len() + n > MAX_CALLBACK_REQUEST_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "callback HTTP request headers too large",
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
 
-        // Parse the GET request to extract code and state
-        let first_line = request
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("empty callback request"))?;
-
-        let mut request_parts = first_line.split_whitespace();
-        let request_method = request_parts.next().unwrap_or_default();
-        let path = request_parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("malformed callback request"))?;
-        if request_method != "GET" {
-            anyhow::bail!("OAuth callback must use GET");
-        }
-
-        let url = url::Url::parse(&format!("http://127.0.0.1{path}"))
-            .context("failed to parse callback URL")?;
-
-        if url.path() != "/callback" {
-            anyhow::bail!("OAuth callback used an unexpected path");
-        }
-
-        let mut callback = CallbackResponse {
-            code: None,
-            state: None,
-            iss: None,
-            error: None,
-        };
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "code" => callback.code = Some(value.into_owned()),
-                "state" => callback.state = Some(value.into_owned()),
-                "iss" => callback.iss = Some(value.into_owned()),
-                "error" => callback.error = Some(value.into_owned()),
-                _ => {}
+            match read_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    debug!(error = %err, "ignoring unreadable callback socket");
+                    continue;
+                }
+                Err(_) => {
+                    debug!("ignoring timed-out preconnect on callback listener");
+                    continue;
+                }
             }
+
+            if buf.is_empty() {
+                // Browser speculative preconnect closed without sending data
+                continue;
+            }
+
+            let request = String::from_utf8_lossy(&buf);
+            let Some(first_line) = request.lines().next() else {
+                continue;
+            };
+            let mut request_parts = first_line.split_whitespace();
+            let request_method = request_parts.next().unwrap_or_default();
+            let Some(path) = request_parts.next() else {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            };
+
+            if request_method != "GET" {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
+
+            let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{path}")) else {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            };
+
+            if url.path() != "/callback" {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
+
+            let mut callback = CallbackResponse {
+                code: None,
+                state: None,
+                iss: None,
+                error: None,
+            };
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "code" => callback.code = Some(value.into_owned()),
+                    "state" => callback.state = Some(value.into_owned()),
+                    "iss" => callback.iss = Some(value.into_owned()),
+                    "error" => callback.error = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+
+            // Keep the callback response generic; never reflect authorization-server input into HTML.
+            let (status, title, message) = if callback.error.is_some() || callback.code.is_none() {
+                (
+                    "400 Bad Request",
+                    "Authorization failed",
+                    "Return to mcp-auth-proxy for details.",
+                )
+            } else {
+                (
+                    "200 OK",
+                    "Authorization received",
+                    "You can close this window and return to mcp-auth-proxy.",
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
+                <html><body><h1>{title}</h1><p>{message}</p></body></html>"
+            );
+
+            let _ = stream.write_all(response.as_bytes()).await;
+
+            return Ok(callback);
         }
-
-        // Keep the callback response generic; never reflect authorization-server input into HTML.
-        let (status, title, message) = if callback.error.is_some() || callback.code.is_none() {
-            (
-                "400 Bad Request",
-                "Authorization failed",
-                "Return to mcp-auth-proxy for details.",
-            )
-        } else {
-            (
-                "200 OK",
-                "Authorization received",
-                "You can close this window and return to mcp-auth-proxy.",
-            )
-        };
-        let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
-            <html><body><h1>{title}</h1><p>{message}</p></body></html>");
-
-        let _ = stream.write_all(response.as_bytes()).await;
-
-        Ok(callback)
     }
 
     /// Refresh the access token using the refresh token.
@@ -570,17 +626,9 @@ impl OAuthAuth {
         client_creds: &ClientCredentials,
         refresh_token: &str,
     ) -> Result<(String, Option<String>, Option<Duration>)> {
-        let mut client_builder = BasicClient::new(ClientId::new(client_creds.client_id.clone()))
+        let client_builder = BasicClient::new(ClientId::new(client_creds.client_id.clone()))
             .set_token_uri(TokenUrl::new(metadata.token_endpoint.clone())?);
-
-        if let Some(ref secret) = client_creds.client_secret {
-            client_builder = client_builder.set_client_secret(ClientSecret::new(secret.clone()));
-        }
-        if client_creds.token_endpoint_auth_method == "client_secret_post" {
-            client_builder = client_builder.set_auth_type(AuthType::RequestBody);
-        }
-
-        let client = client_builder;
+        let client = apply_client_credentials(client_builder, client_creds);
 
         debug!("refreshing OAuth access token");
 
@@ -608,7 +656,7 @@ impl OAuthAuth {
 
     /// Ensure we have a valid access token, refreshing or re-authorizing as needed.
     async fn ensure_token(&self) -> Result<String> {
-        // Check if current token is still valid
+        // Check if current token is still valid without blocking on ongoing auth flows
         {
             let state = self.state.read().await;
             if let Some(ref token) = state.access_token {
@@ -618,25 +666,34 @@ impl OAuthAuth {
             }
         }
 
-        // Need to refresh or authorize
-        let mut state = self.state.write().await;
+        // Serialize discovery / refresh / interactive authorization without holding `state` lock
+        let _refresh_guard = self.refresh_lock.lock().await;
 
-        // Double-check after acquiring write lock
-        if let Some(ref token) = state.access_token {
-            if token.expires_at > Instant::now() {
-                return Ok(token.value.clone());
+        let (mut metadata, mut client_creds, mut refresh_token) = {
+            let state = self.state.read().await;
+            if let Some(ref token) = state.access_token {
+                if token.expires_at > Instant::now() {
+                    return Ok(token.value.clone());
+                }
             }
-        }
+            (
+                state.metadata.clone(),
+                state.client_credentials.clone(),
+                state.refresh_token.clone(),
+            )
+        };
 
         // Ensure metadata is discovered
-        if state.metadata.is_none() {
-            state.metadata = Some(self.discover().await?);
+        if metadata.is_none() {
+            let discovered = self.discover().await?;
+            self.state.write().await.metadata = Some(discovered.clone());
+            metadata = Some(discovered);
         }
-        let metadata = state.metadata.clone().unwrap();
+        let metadata = metadata.expect("metadata populated above");
 
-        // Ensure we have client credentials (from storage or DCR)
-        if state.client_credentials.is_none() {
-            if let Some(client_id) = self.config.client_id.as_ref() {
+        // Ensure we have client credentials (from config, storage, or DCR)
+        if client_creds.is_none() {
+            let creds = if let Some(client_id) = self.config.client_id.as_ref() {
                 let client_secret = match self.config.client_secret_ref.as_deref() {
                     Some(reference) => Some(self.credential_provider.resolve(reference).await?),
                     None => None,
@@ -652,62 +709,48 @@ impl OAuthAuth {
                             "none".to_string()
                         }
                     });
-                if !matches!(
-                    token_endpoint_auth_method.as_str(),
-                    "none" | "client_secret_basic" | "client_secret_post"
-                ) {
-                    anyhow::bail!(
-                        "unsupported OAuth token endpoint auth method '{}'",
-                        token_endpoint_auth_method
-                    );
-                }
-                if token_endpoint_auth_method == "none" && client_secret.is_some() {
-                    anyhow::bail!(
-                        "OAuth client_secret_ref requires client_secret_basic or client_secret_post"
-                    );
-                }
-                if token_endpoint_auth_method != "none" && client_secret.is_none() {
-                    anyhow::bail!(
-                        "OAuth token endpoint auth method '{}' requires client_secret_ref",
-                        token_endpoint_auth_method
-                    );
-                }
-                state.client_credentials = Some(ClientCredentials {
+                validate_token_endpoint_auth_method(
+                    &token_endpoint_auth_method,
+                    client_secret.is_some(),
+                )?;
+                ClientCredentials {
                     client_id: client_id.clone(),
                     client_secret,
                     token_endpoint_auth_method,
-                });
-            } else {
-                // Try loading issuer-bound credentials before performing DCR.
-                if let Some(creds_json) = self
-                    .token_storage
-                    .get(&self.storage_key(&metadata.issuer, "client"))
-                    .await?
-                {
-                    let creds: ClientCredentials = serde_json::from_str(&creds_json)
-                        .context("failed to parse stored DCR credentials")?;
-                    state.client_credentials = Some(creds);
-                } else {
-                    let creds = self.register_client(&metadata).await?;
-                    state.client_credentials = Some(creds);
                 }
-            }
+            } else if let Some(creds_json) = self
+                .token_storage
+                .get(&self.storage_key(&metadata.issuer, "client"))
+                .await?
+            {
+                let creds: ClientCredentials = serde_json::from_str(&creds_json)
+                    .context("failed to parse stored DCR credentials")?;
+                validate_token_endpoint_auth_method(
+                    &creds.token_endpoint_auth_method,
+                    creds.client_secret.is_some(),
+                )?;
+                creds
+            } else {
+                self.register_client(&metadata).await?
+            };
+            self.state.write().await.client_credentials = Some(creds.clone());
+            client_creds = Some(creds);
         }
-        let client_creds = state.client_credentials.clone().unwrap();
+        let client_creds = client_creds.expect("client credentials populated above");
 
-        // Try refresh first if we have a refresh token
-        if state.refresh_token.is_none() {
-            // Try loading from storage
+        // Load refresh token from storage if needed
+        if refresh_token.is_none() {
             if let Some(rt) = self
                 .token_storage
                 .get(&self.storage_key(&metadata.issuer, "refresh_token"))
                 .await?
             {
-                state.refresh_token = Some(rt);
+                self.state.write().await.refresh_token = Some(rt.clone());
+                refresh_token = Some(rt);
             }
         }
 
-        let result = if let Some(ref rt) = state.refresh_token {
+        let result = if let Some(ref rt) = refresh_token {
             match self
                 .refresh_access_token(&metadata, &client_creds, rt)
                 .await
@@ -715,34 +758,31 @@ impl OAuthAuth {
                 Ok(result) => result,
                 Err(e) => {
                     warn!(error = %e, "token refresh failed, falling back to full authorization");
-                    // Clear stale refresh token
-                    state.refresh_token = None;
+                    self.state.write().await.refresh_token = None;
                     let _ = self
                         .token_storage
                         .delete(&self.storage_key(&metadata.issuer, "refresh_token"))
                         .await;
-                    // Full authorization flow
                     self.authorize(&metadata, &client_creds).await?
                 }
             }
         } else {
-            // Full authorization flow
             self.authorize(&metadata, &client_creds).await?
         };
 
-        let (access_token, refresh_token, expires_in) = result;
+        let (access_token, new_refresh_token, expires_in) = result;
 
         // Update state
         let lifetime = expires_in.unwrap_or(Duration::from_secs(3600));
         let expiry_buffer = TOKEN_EXPIRY_BUFFER.min(lifetime / 10);
         let expires_at = Instant::now() + lifetime.saturating_sub(expiry_buffer);
 
+        let mut state = self.state.write().await;
         state.access_token = Some(CachedAccessToken {
             value: access_token.clone(),
             expires_at,
         });
-
-        if let Some(rt) = refresh_token {
+        if let Some(rt) = new_refresh_token {
             state.refresh_token = Some(rt);
         }
 
@@ -766,25 +806,95 @@ impl AuthStrategy for OAuthAuth {
     }
 }
 
-fn canonical_resource_url(resource_url: &str) -> Result<String> {
-    let parsed = url::Url::parse(resource_url).context("invalid OAuth resource URL")?;
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        anyhow::bail!("OAuth resource URL must not contain a query or fragment");
+fn apply_client_credentials<HasAuth, HasDev, HasIntro, HasRev, HasTok>(
+    mut client: BasicClient<HasAuth, HasDev, HasIntro, HasRev, HasTok>,
+    client_creds: &ClientCredentials,
+) -> BasicClient<HasAuth, HasDev, HasIntro, HasRev, HasTok>
+where
+    HasAuth: oauth2::EndpointState,
+    HasDev: oauth2::EndpointState,
+    HasIntro: oauth2::EndpointState,
+    HasRev: oauth2::EndpointState,
+    HasTok: oauth2::EndpointState,
+{
+    if let Some(ref secret) = client_creds.client_secret {
+        client = client.set_client_secret(ClientSecret::new(secret.clone()));
     }
-    if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http"
-            && parsed
-                .host_str()
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|ip| ip.is_loopback()))
-        && !(parsed.scheme() == "http" && parsed.host_str() == Some("localhost"))
-    {
-        anyhow::bail!("OAuth resource URL must use HTTPS, except for a loopback HTTP URL");
+    if client_creds.token_endpoint_auth_method == "client_secret_post" {
+        client = client.set_auth_type(AuthType::RequestBody);
     }
-    if parsed.host_str().is_none() {
-        anyhow::bail!("OAuth resource URL must include a host");
-    }
+    client
+}
 
+fn validate_token_endpoint_auth_method(method: &str, has_secret: bool) -> Result<()> {
+    if !matches!(
+        method,
+        "none" | "client_secret_basic" | "client_secret_post"
+    ) {
+        anyhow::bail!("unsupported OAuth token endpoint auth method '{method}'");
+    }
+    if method == "none" && has_secret {
+        anyhow::bail!("OAuth client_secret requires client_secret_basic or client_secret_post");
+    }
+    if method != "none" && !has_secret {
+        anyhow::bail!("OAuth token endpoint auth method '{method}' requires a client secret");
+    }
+    Ok(())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (lhs, rhs) in a.iter().zip(b.iter()) {
+        diff |= lhs ^ rhs;
+    }
+    diff == 0
+}
+
+fn parse_https_or_loopback_url(raw_url: &str, label: &str, allow_query: bool) -> Result<url::Url> {
+    let parsed = url::Url::parse(raw_url).with_context(|| format!("invalid {label}"))?;
+    if parsed.fragment().is_some() {
+        anyhow::bail!("{label} must not contain a fragment");
+    }
+    if !allow_query && parsed.query().is_some() {
+        anyhow::bail!("{label} must not contain a query");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{label} must not contain credentials");
+    }
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => anyhow::bail!("{label} must include a host"),
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback) {
+        anyhow::bail!("{label} must use HTTPS, except for a loopback HTTP URL");
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn validate_issuer_url(issuer: &str) -> Result<url::Url> {
+    parse_https_or_loopback_url(issuer, "OAuth authorization server issuer", false)
+}
+
+fn validate_server_metadata_endpoints(metadata: &ServerMetadata) -> Result<()> {
+    parse_https_or_loopback_url(
+        &metadata.authorization_endpoint,
+        "OAuth authorization_endpoint",
+        true,
+    )?;
+    parse_https_or_loopback_url(&metadata.token_endpoint, "OAuth token_endpoint", true)?;
+    if let Some(ref reg_endpoint) = metadata.registration_endpoint {
+        parse_https_or_loopback_url(reg_endpoint, "OAuth registration_endpoint", true)?;
+    }
+    Ok(())
+}
+
+fn canonical_resource_url(resource_url: &str) -> Result<String> {
+    let parsed = parse_https_or_loopback_url(resource_url, "OAuth resource URL", false)?;
     let mut canonical = parsed.to_string();
     if canonical.ends_with('/') {
         canonical.pop();
@@ -794,45 +904,12 @@ fn canonical_resource_url(resource_url: &str) -> Result<String> {
 
 fn validate_metadata_url(metadata_url: &str) -> Result<String> {
     let parsed =
-        url::Url::parse(metadata_url).context("invalid protected resource metadata URL")?;
-    if parsed.fragment().is_some() || parsed.host_str().is_none() {
-        anyhow::bail!(
-            "protected resource metadata URL must be absolute and must not include a fragment"
-        );
-    }
-    if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http"
-            && parsed
-                .host_str()
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|ip| ip.is_loopback()))
-        && !(parsed.scheme() == "http" && parsed.host_str() == Some("localhost"))
-    {
-        anyhow::bail!(
-            "protected resource metadata URL must use HTTPS, except for a loopback HTTP URL"
-        );
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        anyhow::bail!("protected resource metadata URL must not contain credentials");
-    }
+        parse_https_or_loopback_url(metadata_url, "protected resource metadata URL", true)?;
     Ok(parsed.to_string())
 }
 
 fn authorization_metadata_urls(issuer: &str) -> Result<Vec<String>> {
-    let parsed = url::Url::parse(issuer).context("invalid OAuth authorization server issuer")?;
-    if parsed.query().is_some() || parsed.fragment().is_some() || parsed.host_str().is_none() {
-        anyhow::bail!("OAuth issuer must be an absolute URL without query or fragment");
-    }
-    if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http"
-            && parsed
-                .host_str()
-                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-                .is_some_and(|ip| ip.is_loopback()))
-        && !(parsed.scheme() == "http" && parsed.host_str() == Some("localhost"))
-    {
-        anyhow::bail!("OAuth issuer must use HTTPS, except for a loopback HTTP URL");
-    }
+    let parsed = validate_issuer_url(issuer)?;
 
     let origin = format!(
         "{}://{}{}",
@@ -1020,9 +1097,15 @@ fn store_challenge_parameter(
 
 #[cfg(test)]
 mod tests {
-    use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+    use std::time::Duration;
 
-    use super::parse_bearer_challenge;
+    use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{
+        canonical_resource_url, parse_bearer_challenge, validate_server_metadata_endpoints,
+        OAuthAuth, ServerMetadata,
+    };
 
     #[test]
     fn parses_resource_metadata_and_scopes_from_bearer_challenge() {
@@ -1054,5 +1137,78 @@ mod tests {
         );
 
         assert_eq!(parse_bearer_challenge(&headers), (None, None));
+    }
+
+    #[test]
+    fn accepts_ipv6_loopback_and_rejects_non_https_endpoints() {
+        assert_eq!(
+            canonical_resource_url("http://[::1]:8080/mcp/").unwrap(),
+            "http://[::1]:8080/mcp"
+        );
+        assert!(canonical_resource_url("http://example.com/mcp").is_err());
+
+        let bad_auth_scheme = ServerMetadata {
+            issuer: "https://auth.example.com".into(),
+            authorization_endpoint: "file:///etc/passwd".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            registration_endpoint: None,
+            authorization_response_iss_parameter_supported: None,
+            resource_scopes: vec![],
+            resource_identifier: String::new(),
+        };
+        assert!(validate_server_metadata_endpoints(&bad_auth_scheme).is_err());
+
+        let bad_token_http = ServerMetadata {
+            issuer: "https://auth.example.com".into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "http://auth.example.com/token".into(),
+            registration_endpoint: None,
+            authorization_response_iss_parameter_supported: None,
+            resource_scopes: vec![],
+            resource_identifier: String::new(),
+        };
+        assert!(validate_server_metadata_endpoints(&bad_token_http).is_err());
+    }
+
+    #[tokio::test]
+    async fn callback_listener_ignores_stray_requests_and_handles_split_reads() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let waiter = tokio::spawn(async move {
+            OAuthAuth::wait_for_callback(listener, Duration::from_secs(5)).await
+        });
+
+        // 1. Preconnect that closes without data
+        let preconnect = tokio::net::TcpStream::connect(addr).await.unwrap();
+        drop(preconnect);
+
+        // 2. Stray /favicon.ico request
+        let mut favicon = tokio::net::TcpStream::connect(addr).await.unwrap();
+        favicon
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut fav_buf = [0u8; 64];
+        let _ = favicon.read(&mut fav_buf).await.unwrap();
+
+        // 3. Real callback split across TCP writes
+        let mut cb = tokio::net::TcpStream::connect(addr).await.unwrap();
+        cb.write_all(b"GET /callback?code=abc123").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cb.write_all(b"&state=xyz789 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = waiter.await.unwrap().unwrap();
+        assert_eq!(resp.code.as_deref(), Some("abc123"));
+        assert_eq!(resp.state.as_deref(), Some("xyz789"));
+    }
+
+    #[tokio::test]
+    async fn callback_listener_times_out_when_abandoned() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let res = OAuthAuth::wait_for_callback(listener, Duration::from_millis(50)).await;
+        assert!(res.is_err());
     }
 }
