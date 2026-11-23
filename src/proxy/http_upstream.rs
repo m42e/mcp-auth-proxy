@@ -301,7 +301,14 @@ impl HttpUpstream {
         }
 
         if let Ok(response) = parse_jsonrpc_response(&reply) {
-            if reply.status.is_success() || response.get("error").is_some() {
+            // Legacy servers may reject discovery before a session exists (-32600).
+            // Still honor explicit version negotiation on HTTP error responses.
+            let version_negotiation =
+                response.pointer("/error/code").and_then(Value::as_i64) == Some(-32022);
+            if reply.status.is_success()
+                || version_negotiation
+                || (!reply.status.is_client_error() && response.get("error").is_some())
+            {
                 match evaluate_discovery_response(&response)? {
                     DiscoveryOutcome::ModernWithTools => {
                         return self
@@ -510,6 +517,51 @@ mod tests {
         should_strip_request_header, should_strip_response_header, HttpUpstream,
     };
     use http::{header, HeaderMap, HeaderValue, Method};
+
+    #[tokio::test]
+    async fn falls_back_after_legacy_http_discovery_rejection() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route("/", post(
+            |State(methods): State<Arc<Mutex<Vec<String>>>>, Json(msg): Json<Value>| async move {
+                let method = msg["method"].as_str().unwrap();
+                methods.lock().unwrap().push(method.to_owned());
+                let (status, result) = match method {
+                    "server/discover" => (http::StatusCode::BAD_REQUEST,
+                        json!({"error": {"code": -32600, "message": "Missing session"}})),
+                    "initialize" => (http::StatusCode::OK,
+                        json!({"result": {"protocolVersion": "2025-06-18", "capabilities": {}}})),
+                    "notifications/initialized" => (http::StatusCode::ACCEPTED, json!({})),
+                    "tools/list" => (http::StatusCode::OK,
+                        json!({"result": {"tools": [{"name": "legacy_tool"}]}})),
+                    _ => panic!("unexpected method: {method}"),
+                };
+                let mut response = result;
+                response["jsonrpc"] = json!("2.0");
+                response["id"] = msg["id"].clone();
+                (status, Json(response))
+            }
+        )).with_state(methods.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let upstream = HttpUpstream::new("legacy".into(), format!("http://{addr}"), false).unwrap();
+        let tools = upstream.fetch_tools(&[]).await.unwrap();
+        assert_eq!(tools, vec![json!({"name": "legacy_tool"})]);
+        assert_eq!(
+            *methods.lock().unwrap(),
+            vec![
+                "server/discover",
+                "initialize",
+                "notifications/initialized",
+                "tools/list"
+            ]
+        );
+        server.abort();
+    }
 
     #[test]
     fn builds_upstream_url_without_spurious_trailing_slash() {
