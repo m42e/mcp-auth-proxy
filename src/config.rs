@@ -17,6 +17,12 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Optional credential-provider reference for `/settings` Bearer authentication.
+    #[serde(default)]
+    pub admin_token_ref: Option<String>,
+    /// Allow dynamic servers registered via `/settings` to use plain `http://` on non-loopback hosts.
+    #[serde(default)]
+    pub allow_insecure_dynamic_upstreams: bool,
 }
 
 fn default_host() -> String {

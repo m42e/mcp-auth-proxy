@@ -2,16 +2,19 @@ pub mod http_upstream;
 pub mod stdio_upstream;
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
     extract::{Path, Request, State},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use http::StatusCode;
+use http::{header, HeaderValue, Method, StatusCode};
+use rand::RngCore;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -44,6 +47,24 @@ pub struct UpstreamState {
     pub log_mcp_traffic: bool,
 }
 
+/// Security configuration applied to `/settings` routes.
+#[derive(Clone)]
+pub struct SettingsSecurityConfig {
+    pub bound_host: String,
+    pub admin_token: Option<String>,
+    pub allow_insecure_dynamic_upstreams: bool,
+}
+
+impl Default for SettingsSecurityConfig {
+    fn default() -> Self {
+        Self {
+            bound_host: "127.0.0.1".to_string(),
+            admin_token: None,
+            allow_insecure_dynamic_upstreams: false,
+        }
+    }
+}
+
 /// Shared application state.
 pub struct AppState {
     pub upstreams: RwLock<HashMap<String, Arc<UpstreamState>>>,
@@ -52,9 +73,11 @@ pub struct AppState {
     pub mcp_server_store: McpServerStore,
     pub credential_provider: Arc<dyn CredentialProvider>,
     pub token_storage: Arc<dyn TokenStorage>,
+    pub settings_security: SettingsSecurityConfig,
 }
 
-/// Build the axum router with path-prefix routing, settings API, and profile support.
+/// Build the axum router with default loopback security settings.
+#[allow(dead_code)]
 pub fn build_router(
     upstreams: Vec<Arc<UpstreamState>>,
     tool_cache: ToolCache,
@@ -62,6 +85,27 @@ pub fn build_router(
     mcp_server_store: McpServerStore,
     credential_provider: Arc<dyn CredentialProvider>,
     token_storage: Arc<dyn TokenStorage>,
+) -> Router {
+    build_router_with_security(
+        upstreams,
+        tool_cache,
+        profile_store,
+        mcp_server_store,
+        credential_provider,
+        token_storage,
+        SettingsSecurityConfig::default(),
+    )
+}
+
+/// Build the axum router with path-prefix routing, settings security middleware, and profile support.
+pub fn build_router_with_security(
+    upstreams: Vec<Arc<UpstreamState>>,
+    tool_cache: ToolCache,
+    profile_store: ProfileStore,
+    mcp_server_store: McpServerStore,
+    credential_provider: Arc<dyn CredentialProvider>,
+    token_storage: Arc<dyn TokenStorage>,
+    settings_security: SettingsSecurityConfig,
 ) -> Router {
     let upstream_map: HashMap<String, Arc<UpstreamState>> =
         upstreams.into_iter().map(|u| (u.name.clone(), u)).collect();
@@ -73,9 +117,10 @@ pub fn build_router(
         mcp_server_store,
         credential_provider,
         token_storage,
+        settings_security,
     });
 
-    Router::new()
+    let settings_routes = Router::new()
         // Web UI
         .route("/settings", get(settings_ui))
         // Settings API — upstreams list
@@ -101,15 +146,180 @@ pub fn build_router(
             "/settings/servers/{name}",
             get(get_server).put(update_server).delete(delete_server),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            settings_security_middleware,
+        ));
+
+    Router::new()
+        .merge(settings_routes)
         // Everything else goes through the main router
         .fallback(root_handler)
         .with_state(state)
 }
 
+pub fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+pub fn generate_random_hex_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (lhs, rhs) in a.iter().zip(b.iter()) {
+        diff |= lhs ^ rhs;
+    }
+    diff == 0
+}
+
+fn extract_host_only(raw_host: &str) -> Option<String> {
+    let trimmed = raw_host.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let after = &rest[end + 1..];
+        if !after.is_empty() && !after.starts_with(':') {
+            return None;
+        }
+        return Some(rest[..end].to_ascii_lowercase());
+    }
+    Some(trimmed.split(':').next().unwrap_or("").to_ascii_lowercase())
+}
+
+async fn settings_security_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let headers = request.headers();
+
+    // 1. Validate Host header to block DNS rebinding
+    let raw_host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| request.uri().authority().map(|a| a.as_str()));
+    let Some(raw_host) = raw_host else {
+        return (StatusCode::FORBIDDEN, "missing Host header").into_response();
+    };
+    let Some(host_only) = extract_host_only(raw_host) else {
+        return (StatusCode::FORBIDDEN, "invalid Host header").into_response();
+    };
+
+    let bound = &state.settings_security.bound_host;
+    if is_loopback_host(bound) {
+        if !is_loopback_host(&host_only) {
+            return (StatusCode::FORBIDDEN, "invalid Host for loopback listener").into_response();
+        }
+    } else if bound != "0.0.0.0" && bound != "::" && bound != "[::]" {
+        let bound_norm = bound
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if host_only != bound_norm && !is_loopback_host(&host_only) {
+            return (StatusCode::FORBIDDEN, "Host header mismatch").into_response();
+        }
+    }
+
+    // 2. Reject cross-site browser requests (CSRF protection)
+    if let Some(fetch_site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        if !matches!(fetch_site, "same-origin" | "none") {
+            return (StatusCode::FORBIDDEN, "cross-site request rejected").into_response();
+        }
+    }
+
+    if !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            let Ok(parsed_origin) = url::Url::parse(origin) else {
+                return (StatusCode::FORBIDDEN, "invalid Origin header").into_response();
+            };
+            let Some(origin_host) = parsed_origin.host_str() else {
+                return (StatusCode::FORBIDDEN, "invalid Origin host").into_response();
+            };
+            if origin_host.trim_matches(['[', ']']).to_ascii_lowercase() != host_only {
+                return (StatusCode::FORBIDDEN, "Origin host mismatch").into_response();
+            }
+        } else if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+            let Ok(parsed_ref) = url::Url::parse(referer) else {
+                return (StatusCode::FORBIDDEN, "invalid Referer header").into_response();
+            };
+            let Some(ref_host) = parsed_ref.host_str() else {
+                return (StatusCode::FORBIDDEN, "invalid Referer host").into_response();
+            };
+            if ref_host.trim_matches(['[', ']']).to_ascii_lowercase() != host_only {
+                return (StatusCode::FORBIDDEN, "Referer host mismatch").into_response();
+            }
+        }
+    }
+
+    // 3. Enforce admin Bearer token on /settings/* API endpoints when configured
+    if path != "/settings" {
+        if let Some(ref expected) = state.settings_security.admin_token {
+            let provided = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    let (scheme, token) = v.split_once(' ')?;
+                    scheme
+                        .eq_ignore_ascii_case("Bearer")
+                        .then_some(token.trim())
+                });
+            let authorized = provided
+                .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()));
+            if !authorized {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer realm=\"mcp-auth-proxy\"")],
+                    "unauthorized",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut response = next.run(request).await;
+    let resp_headers = response.headers_mut();
+    resp_headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    resp_headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp_headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    resp_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 // ── Web UI ─────────────────────────────────────────────────────────
 
-async fn settings_ui() -> impl IntoResponse {
-    Html(include_str!("../web/settings.html"))
+async fn settings_ui() -> Response {
+    let nonce = generate_random_hex_token();
+    let html = include_str!("../web/settings.html").replace("__CSP_NONCE__", &nonce);
+    let csp = format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    );
+    let mut response = Html(html).into_response();
+    if let Ok(csp_val) = HeaderValue::from_str(&csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, csp_val);
+    }
+    response
 }
 
 // ── Settings API: upstreams ────────────────────────────────────────
@@ -354,6 +564,12 @@ async fn create_server(
     if let Err(err_resp) = validate_route_name(&server.name, "server name") {
         return err_resp.into_response();
     }
+    if let Err(err_msg) = validate_dynamic_upstream_url(
+        &server.url,
+        state.settings_security.allow_insecure_dynamic_upstreams,
+    ) {
+        return (StatusCode::BAD_REQUEST, err_msg).into_response();
+    }
     if state.profile_store.get(&server.name).await.is_some() {
         return (
             StatusCode::CONFLICT,
@@ -425,6 +641,12 @@ async fn update_server(
     }
 
     server.name = name;
+    if let Err(err_msg) = validate_dynamic_upstream_url(
+        &server.url,
+        state.settings_security.allow_insecure_dynamic_upstreams,
+    ) {
+        return (StatusCode::BAD_REQUEST, err_msg).into_response();
+    }
     let upstream = match build_dynamic_upstream(
         &server,
         state.credential_provider.clone(),
@@ -457,6 +679,54 @@ async fn update_server(
     info!(server = %server.name, "updated MCP server");
     spawn_tool_cache_refresh(state.tool_cache.clone(), upstream);
     Json(server).into_response()
+}
+
+fn validate_dynamic_upstream_url(raw_url: &str, allow_insecure: bool) -> Result<(), String> {
+    let parsed = url::Url::parse(raw_url).map_err(|e| format!("invalid server URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("server URL must use http or https".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("server URL must not include embedded credentials".to_string());
+    }
+    let Some(host) = parsed.host() else {
+        return Err("server URL must include a host".to_string());
+    };
+
+    let is_loopback = match host {
+        url::Host::Domain(domain) => {
+            let lower = domain.to_ascii_lowercase();
+            if lower == "metadata.google.internal"
+                || lower == "metadata"
+                || lower == "instance-data"
+            {
+                return Err("server URL host is disallowed".to_string());
+            }
+            lower == "localhost"
+        }
+        url::Host::Ipv4(ip) => {
+            if ip.is_unspecified() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() {
+                return Err("server URL IP address is disallowed".to_string());
+            }
+            ip.is_loopback()
+        }
+        url::Host::Ipv6(ip) => {
+            let segs = ip.segments();
+            let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+            let is_ec2_imds = segs[0] == 0xfd00 && segs[1] == 0x0ec2;
+            if ip.is_unspecified() || ip.is_multicast() || is_link_local || is_ec2_imds {
+                return Err("server URL IPv6 address is disallowed".to_string());
+            }
+            ip.is_loopback()
+        }
+    };
+
+    if parsed.scheme() != "https" && !is_loopback && !allow_insecure {
+        return Err(
+            "dynamic server URL must use https (except for loopback addresses)".to_string(),
+        );
+    }
+    Ok(())
 }
 
 async fn delete_server(
@@ -996,8 +1266,8 @@ async fn do_proxy(upstream: &UpstreamState, request: Request<Body>) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::{
-        build_router, enforce_profile_request, filter_tools_in_message, is_dot_segment,
-        UpstreamState,
+        build_router, build_router_with_security, enforce_profile_request, filter_tools_in_message,
+        is_dot_segment, UpstreamState,
     };
     use crate::auth::AuthStrategy;
     use crate::config::TransportType;
@@ -1186,6 +1456,99 @@ mod tests {
             raw_resp_str.starts_with("HTTP/1.1 400"),
             "expected 400 Bad Request, got: {raw_resp_str}"
         );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn settings_security_blocks_dns_rebinding_csrf_ssrf_and_requires_auth() {
+        let dir = temp_dir("settings-security");
+        let profile_store = ProfileStore::new(dir.join("profiles.json"));
+        let server_store = McpServerStore::new(dir.join("servers.json"));
+        let app = build_router_with_security(
+            vec![],
+            ToolCache::new(),
+            profile_store,
+            server_store,
+            Arc::new(DummyCreds),
+            Arc::new(DummyStorage),
+            super::SettingsSecurityConfig {
+                bound_host: "127.0.0.1".into(),
+                admin_token: Some("top-secret-token".into()),
+                allow_insecure_dynamic_upstreams: false,
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // UI loads with CSP + frame-ancestors + no-store
+        let ui = client.get(format!("{base}/settings")).send().await.unwrap();
+        assert_eq!(ui.status(), reqwest::StatusCode::OK);
+        assert_eq!(ui.headers().get("x-frame-options").unwrap(), "DENY");
+        assert!(ui
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("script-src 'nonce-"));
+
+        // API requires Bearer token
+        let unauth = client
+            .get(format!("{base}/settings/servers"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // DNS rebinding Host rejected
+        let rebind = client
+            .get(format!("{base}/settings/servers"))
+            .header("Host", "evil.example:3100")
+            .header("Authorization", "Bearer top-secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebind.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // Cross-origin POST rejected
+        let csrf = client
+            .post(format!("{base}/settings/profiles"))
+            .header("Origin", "https://evil.example")
+            .header("Authorization", "Bearer top-secret-token")
+            .json(&json!({"name": "p1", "allowed_tools": {}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // SSRF metadata IP and plain non-loopback HTTP rejected
+        for bad_url in [
+            "http://169.254.169.254/latest/meta-data",
+            "https://169.254.169.254/latest/meta-data",
+            "http://evil.example/mcp",
+        ] {
+            let ssrf = client
+                .post(format!("{base}/settings/servers"))
+                .header("Authorization", "Bearer top-secret-token")
+                .json(&json!({
+                    "name": "srv1",
+                    "url": bad_url,
+                    "credential_ref": "op://Private/x/y"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ssrf.status(), reqwest::StatusCode::BAD_REQUEST, "{bad_url}");
+        }
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);

@@ -175,18 +175,59 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Resolve optional / required /settings admin token
+    let admin_token = if let Some(ref token_ref) = config.server.admin_token_ref {
+        Some(
+            credential_provider
+                .resolve(token_ref)
+                .await
+                .with_context(|| {
+                    format!("failed to resolve server.admin_token_ref '{token_ref}'")
+                })?,
+        )
+    } else if let Ok(env_token) = std::env::var("MCP_AUTH_PROXY_ADMIN_TOKEN") {
+        if !env_token.is_empty() {
+            Some(env_token)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let admin_token = match admin_token {
+        Some(token) => Some(token),
+        None if !proxy::is_loopback_host(&config.server.host) => {
+            let generated = proxy::generate_random_hex_token();
+            warn!(
+                host = %config.server.host,
+                "server.host is non-loopback and no admin token was configured; generated an ephemeral /settings admin token"
+            );
+            eprintln!("Generated ephemeral /settings admin token: {generated}");
+            Some(generated)
+        }
+        None => None,
+    };
+
+    let settings_security = proxy::SettingsSecurityConfig {
+        bound_host: config.server.host.clone(),
+        admin_token,
+        allow_insecure_dynamic_upstreams: config.server.allow_insecure_dynamic_upstreams,
+    };
+
     // Clone upstreams for background cache refresh
     let upstreams_for_cache: Vec<Arc<proxy::UpstreamState>> = upstreams.to_vec();
     let tool_cache_bg = tool_cache.clone();
 
     // Build router
-    let app = proxy::build_router(
+    let app = proxy::build_router_with_security(
         upstreams,
         tool_cache,
         profile_store,
         mcp_server_store,
         credential_provider,
         token_storage,
+        settings_security,
     );
 
     // Start server

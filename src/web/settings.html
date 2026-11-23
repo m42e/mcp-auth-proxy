@@ -12,7 +12,13 @@ a:hover { text-decoration: underline; }
 
 .container { max-width: 860px; margin: 0 auto; padding: 32px 24px; }
 h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
-.subtitle { color: #666; font-size: 13px; margin-bottom: 32px; }
+.subtitle { color: #666; font-size: 13px; margin-bottom: 24px; }
+
+.auth-banner { display: none; background: #fff8e1; border: 1px solid #ffe082; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px; }
+.auth-banner.visible { display: block; }
+.auth-banner p { font-size: 13px; margin-bottom: 8px; color: #5d4037; }
+.auth-row { display: flex; gap: 8px; }
+.auth-row input { flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-family: inherit; }
 
 .section { margin-bottom: 36px; }
 .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -26,11 +32,13 @@ tr:hover td { background: #f9f9f9; }
 
 .tag { display: inline-block; background: #eef2f7; color: #3b6; border-radius: 3px; padding: 1px 6px; font-size: 12px; margin: 1px 2px; }
 .tag-tool { background: #f0f0f0; color: #555; }
+.muted { color: #999; font-size: 12px; }
 
 .empty { color: #999; font-style: italic; padding: 20px 12px; text-align: center; }
 
 button, .btn { display: inline-block; padding: 5px 14px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; background: #fff; color: #333; cursor: pointer; font-family: inherit; }
 button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
+button:disabled { opacity: 0.6; cursor: not-allowed; }
 .btn-primary { background: #3b7dd8; color: #fff; border-color: #3b7dd8; }
 .btn-primary:hover { background: #336db8; }
 .btn-sm { padding: 3px 10px; font-size: 12px; }
@@ -55,6 +63,7 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
 .field input[type="text"]:focus { outline: none; border-color: #3b7dd8; box-shadow: 0 0 0 2px rgba(59,125,216,0.15); }
 .field-inline label { display: flex; align-items: center; font-size: 13px; font-weight: 500; text-transform: none; letter-spacing: 0; cursor: pointer; }
 .field-note { margin-top: 6px; color: #777; font-size: 12px; }
+.field-label-hint { font-weight: normal; color: #999; text-transform: none; }
 
 .tool-picker { border: 1px solid #e0e0e0; border-radius: 4px; max-height: 260px; overflow-y: auto; }
 .tool-picker-group { border-bottom: 1px solid #eee; }
@@ -65,8 +74,8 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
 .tool-item label { cursor: pointer; display: flex; align-items: center; gap: 6px; }
 .tool-item:hover { background: #fafafa; }
 
-.refresh-icon { cursor: pointer; font-size: 14px; color: #888; }
-.refresh-icon:hover { color: #3b7dd8; }
+.refresh-btn { border: none; background: transparent; padding: 2px 6px; font-size: 14px; color: #888; }
+.refresh-btn:hover { background: transparent; color: #3b7dd8; }
 
 .status { position: fixed; bottom: 20px; right: 20px; padding: 8px 16px; border-radius: 4px; font-size: 13px; display: none; z-index: 20; }
 .status.ok { display: block; background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
@@ -79,13 +88,22 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
   <h1>MCP Auth Proxy</h1>
   <p class="subtitle">Manage MCP servers, profiles, and view cached upstream tools</p>
 
+  <div class="auth-banner" id="auth-banner">
+    <p>Admin token required for settings API requests.</p>
+    <div class="auth-row">
+      <input type="password" id="admin-token-input" placeholder="Paste admin bearer token" autocomplete="off">
+      <button type="button" class="btn btn-primary btn-sm" id="admin-token-save">Unlock</button>
+      <button type="button" class="btn btn-sm" id="admin-token-clear">Clear</button>
+    </div>
+  </div>
+
   <!-- Tools section -->
   <div class="section">
     <div class="section-header">
       <h2>Upstream Tools</h2>
-      <button class="btn btn-sm" onclick="refreshAllTools()">Refresh All</button>
+      <button type="button" class="btn btn-sm" id="refresh-all-btn">Refresh All</button>
     </div>
-    <table>
+    <table id="tools-table">
       <thead><tr><th>Upstream</th><th>Tools</th><th style="width:60px"></th></tr></thead>
       <tbody id="tools-body"></tbody>
     </table>
@@ -96,10 +114,10 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
   <div class="section">
     <div class="section-header">
       <h2>MCP Servers</h2>
-      <button class="btn btn-sm btn-primary" onclick="openCreateServer()">Add Server</button>
+      <button type="button" class="btn btn-sm btn-primary" id="add-server-btn">Add Server</button>
     </div>
-    <table>
-      <thead><tr><th>Name</th><th>URL</th><th>Auth</th><th style="width:100px"></th></tr></thead>
+    <table id="servers-table">
+      <thead><tr><th>Name</th><th>URL</th><th>Auth</th><th style="width:120px"></th></tr></thead>
       <tbody id="servers-body"></tbody>
     </table>
     <div id="servers-empty" class="empty" style="display:none">No additional MCP servers configured</div>
@@ -109,10 +127,10 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
   <div class="section">
     <div class="section-header">
       <h2>Profiles</h2>
-      <button class="btn btn-sm btn-primary" onclick="openCreateProfile()">New Profile</button>
+      <button type="button" class="btn btn-sm btn-primary" id="new-profile-btn">New Profile</button>
     </div>
-    <table>
-      <thead><tr><th>Profile</th><th>Prefix</th><th>Allowed Tools</th><th style="width:100px"></th></tr></thead>
+    <table id="profiles-table">
+      <thead><tr><th>Profile</th><th>Prefix</th><th>Allowed Tools</th><th style="width:120px"></th></tr></thead>
       <tbody id="profiles-body"></tbody>
     </table>
     <div id="profiles-empty" class="empty" style="display:none">No profiles defined yet</div>
@@ -120,15 +138,15 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
 </div>
 
 <!-- Profile modal -->
-<div class="overlay" id="profile-overlay" onclick="if(event.target===this)closeModal()">
+<div class="overlay" id="profile-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
   <div class="modal">
     <div class="modal-header">
       <h3 id="modal-title">New Profile</h3>
-      <button class="btn btn-sm" onclick="closeModal()">&times;</button>
+      <button type="button" class="btn btn-sm" id="profile-modal-close" aria-label="Close">&times;</button>
     </div>
     <div class="modal-body">
       <div class="field">
-        <label>Profile Name</label>
+        <label for="profile-name">Profile Name</label>
         <input type="text" id="profile-name" placeholder="e.g. readonly">
       </div>
       <div class="field">
@@ -137,61 +155,81 @@ button:hover, .btn:hover { background: #f5f5f5; border-color: #bbb; }
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="modal-save" onclick="saveProfile()">Create</button>
+      <button type="button" class="btn" id="profile-modal-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="modal-save">Create</button>
     </div>
   </div>
 </div>
 
 <!-- Server modal -->
-<div class="overlay" id="server-overlay" onclick="if(event.target===this)closeServerModal()">
+<div class="overlay" id="server-overlay" role="dialog" aria-modal="true" aria-labelledby="server-modal-title">
   <div class="modal">
     <div class="modal-header">
       <h3 id="server-modal-title">Add MCP Server</h3>
-      <button class="btn btn-sm" onclick="closeServerModal()">&times;</button>
+      <button type="button" class="btn btn-sm" id="server-modal-close" aria-label="Close">&times;</button>
     </div>
     <div class="modal-body">
       <div class="field">
-        <label>Name</label>
+        <label for="server-name">Name</label>
         <input type="text" id="server-name" placeholder="e.g. my-server">
       </div>
       <div class="field">
-        <label>URL</label>
+        <label for="server-url">URL</label>
         <input type="text" id="server-url" placeholder="https://api.example.com/mcp">
       </div>
       <div class="field">
-        <label>Auth Header</label>
+        <label for="server-auth-header">Auth Header</label>
         <input type="text" id="server-auth-header" placeholder="Authorization" value="Authorization">
       </div>
       <div class="field">
-        <label>Auth Prefix <span style="font-weight:normal;color:#999">(optional, e.g. Bearer)</span></label>
+        <label for="server-auth-prefix">Auth Prefix <span class="field-label-hint">(optional, e.g. Bearer)</span></label>
         <input type="text" id="server-auth-prefix" placeholder="Bearer">
       </div>
       <div class="field">
-        <label>Credential Reference</label>
+        <label for="server-credential-ref">Credential Reference</label>
         <input type="text" id="server-credential-ref" placeholder="op://Private/my-server/api-key">
       </div>
       <div class="field field-inline">
-        <label><input type="checkbox" id="server-log-mcp-traffic"> Log MCP calls and responses</label>
-        <p class="field-note">Logs can get large quickly when this is enabled.</p>
+        <label for="server-log-mcp-traffic"><input type="checkbox" id="server-log-mcp-traffic"> Log MCP calls and responses</label>
+        <p class="field-note">Logs can get large quickly and may contain sensitive payloads when enabled.</p>
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn" onclick="closeServerModal()">Cancel</button>
-      <button class="btn btn-primary" id="server-modal-save" onclick="saveServer()">Add</button>
+      <button type="button" class="btn" id="server-modal-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="server-modal-save">Add</button>
     </div>
   </div>
 </div>
 
 <div class="status" id="status-toast"></div>
 
-<script>
+<script nonce="__CSP_NONCE__">
 const API = '';
+const TOKEN_STORAGE_KEY = 'mcp_auth_proxy_admin_token';
 let cachedTools = {};
 let editingProfile = null;
+let editingServer = null;
+let editingExtraHeaders = [];
 
-async function api(path, opts) {
-  const r = await fetch(API + path, opts);
+function getAdminToken() {
+  return sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+}
+
+function showAuthBanner(visible) {
+  document.getElementById('auth-banner').classList.toggle('visible', visible);
+}
+
+async function api(path, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  const token = getAdminToken();
+  if (token) {
+    headers.set('Authorization', 'Bearer ' + token);
+  }
+  const r = await fetch(API + path, { ...opts, headers });
+  if (r.status === 401) {
+    showAuthBanner(true);
+    throw new Error('Unauthorized — enter admin token');
+  }
   if (!r.ok && r.status !== 204) {
     const txt = await r.text();
     throw new Error(txt || r.statusText);
@@ -205,7 +243,47 @@ function toast(msg, ok) {
   el.textContent = msg;
   el.className = 'status ' + (ok ? 'ok' : 'err');
   clearTimeout(el._t);
-  el._t = setTimeout(() => el.className = 'status', 2500);
+  el._t = setTimeout(() => { el.className = 'status'; }, 2500);
+}
+
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  if (props.className) node.className = props.className;
+  if (props.text !== undefined) node.textContent = props.text;
+  if (props.title) node.title = props.title;
+  if (props.type) node.type = props.type;
+  if (props.attrs) {
+    for (const [k, v] of Object.entries(props.attrs)) {
+      node.setAttribute(k, v);
+    }
+  }
+  if (props.dataset) {
+    for (const [k, v] of Object.entries(props.dataset)) {
+      node.dataset[k] = v;
+    }
+  }
+  if (props.onClick) {
+    node.addEventListener('click', props.onClick);
+  }
+  for (const child of children) {
+    if (typeof child === 'string') {
+      node.appendChild(document.createTextNode(child));
+    } else if (child) {
+      node.appendChild(child);
+    }
+  }
+  return node;
+}
+
+function appendTags(container, items, emptyText) {
+  if (!items.length) {
+    container.appendChild(el('span', { className: 'muted', text: emptyText }));
+    return;
+  }
+  items.forEach((label, idx) => {
+    if (idx > 0) container.appendChild(document.createTextNode(' '));
+    container.appendChild(el('span', { className: 'tag tag-tool', text: label }));
+  });
 }
 
 // ── Tools ──
@@ -219,15 +297,24 @@ async function loadTools() {
 
 function renderTools() {
   const tb = document.getElementById('tools-body');
-  const keys = Object.keys(cachedTools);
+  const keys = Object.keys(cachedTools).sort();
   document.getElementById('tools-empty').style.display = keys.length ? 'none' : 'block';
-  tb.closest('table').style.display = keys.length ? '' : 'none';
-  tb.innerHTML = keys.sort().map(name => {
-    const tools = cachedTools[name] || [];
-    const tags = tools.map(t => '<span class="tag tag-tool">' + esc(t.name || '?') + '</span>').join(' ');
-    return '<tr><td><strong>' + esc(name) + '</strong></td><td>' + (tags || '<span style="color:#999">none</span>') +
-      '</td><td><span class="refresh-icon" title="Refresh" onclick="refreshTools(\'' + esc(name) + '\')">&#x21bb;</span></td></tr>';
-  }).join('');
+  document.getElementById('tools-table').style.display = keys.length ? '' : 'none';
+  tb.replaceChildren(...keys.map(name => {
+    const tools = (cachedTools[name] || []).map(t => t.name || '?');
+    const nameCell = el('td', {}, [el('strong', { text: name })]);
+    const toolsCell = el('td');
+    appendTags(toolsCell, tools, 'none');
+    const refreshBtn = el('button', {
+      type: 'button',
+      className: 'refresh-btn',
+      title: 'Refresh',
+      text: '\u21bb',
+      attrs: { 'aria-label': 'Refresh ' + name },
+      onClick: () => refreshTools(name),
+    });
+    return el('tr', {}, [nameCell, toolsCell, el('td', {}, [refreshBtn])]);
+  }));
 }
 
 async function refreshTools(name) {
@@ -240,8 +327,12 @@ async function refreshTools(name) {
 }
 
 async function refreshAllTools() {
-  for (const name of Object.keys(cachedTools)) {
-    await refreshTools(name);
+  const btn = document.getElementById('refresh-all-btn');
+  btn.disabled = true;
+  try {
+    await Promise.allSettled(Object.keys(cachedTools).map(name => refreshTools(name)));
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -257,19 +348,25 @@ async function loadProfiles() {
 function renderProfiles(profiles) {
   const tb = document.getElementById('profiles-body');
   document.getElementById('profiles-empty').style.display = profiles.length ? 'none' : 'block';
-  tb.closest('table').style.display = profiles.length ? '' : 'none';
-  tb.innerHTML = profiles.sort((a, b) => a.name.localeCompare(b.name)).map(p => {
-    const toolTags = Object.entries(p.allowed_tools || {}).flatMap(([up, tools]) =>
-      tools.map(t => '<span class="tag tag-tool">' + esc(up) + '/' + esc(t) + '</span>')
-    ).join(' ');
-    return '<tr><td><strong>' + esc(p.name) + '</strong></td>' +
-      '<td><code>/' + esc(p.name) + '/&lt;upstream&gt;/…</code></td>' +
-      '<td>' + (toolTags || '<span style="color:#999">none</span>') + '</td>' +
-      '<td><div class="actions">' +
-        '<button class="btn btn-sm" onclick="openEditProfile(\'' + esc(p.name) + '\')">Edit</button>' +
-        '<button class="btn btn-sm btn-danger" onclick="deleteProfile(\'' + esc(p.name) + '\')">Delete</button>' +
-      '</div></td></tr>';
-  }).join('');
+  document.getElementById('profiles-table').style.display = profiles.length ? '' : 'none';
+  const sorted = [...profiles].sort((a, b) => a.name.localeCompare(b.name));
+  tb.replaceChildren(...sorted.map(p => {
+    const nameCell = el('td', {}, [el('strong', { text: p.name })]);
+    const prefixCell = el('td', {}, [el('code', { text: '/' + p.name + '/<upstream>/\u2026' })]);
+    const tools = [];
+    for (const [up, list] of Object.entries(p.allowed_tools || {})) {
+      for (const tool of list) tools.push(up + '/' + tool);
+    }
+    const toolsCell = el('td');
+    appendTags(toolsCell, tools, 'none');
+    const actionsCell = el('td', {}, [
+      el('div', { className: 'actions' }, [
+        el('button', { type: 'button', className: 'btn btn-sm', text: 'Edit', onClick: () => openEditProfile(p.name) }),
+        el('button', { type: 'button', className: 'btn btn-sm btn-danger', text: 'Delete', onClick: () => deleteProfile(p.name) }),
+      ]),
+    ]);
+    return el('tr', {}, [nameCell, prefixCell, toolsCell, actionsCell]);
+  }));
 }
 
 async function deleteProfile(name) {
@@ -281,7 +378,7 @@ async function deleteProfile(name) {
   } catch (e) { toast('Delete failed: ' + e.message, false); }
 }
 
-// ── Modal ──
+// ── Profile Modal ──
 
 function openCreateProfile() {
   editingProfile = null;
@@ -314,28 +411,45 @@ function renderToolPicker(selected) {
   const picker = document.getElementById('tool-picker');
   const upstreams = Object.keys(cachedTools).sort();
   if (!upstreams.length) {
-    picker.innerHTML = '<div class="empty">No tools cached yet — refresh upstreams first</div>';
+    picker.replaceChildren(el('div', { className: 'empty', text: 'No tools cached yet — refresh upstreams first' }));
     return;
   }
-  picker.innerHTML = upstreams.map(name => {
+  picker.replaceChildren(...upstreams.map(name => {
     const tools = cachedTools[name] || [];
     const sel = selected[name] || [];
     const allChecked = tools.length > 0 && tools.every(t => sel.includes(t.name));
-    return '<div class="tool-picker-group">' +
-      '<div class="tool-picker-group-header"><label><input type="checkbox" data-upstream="' + esc(name) + '" class="upstream-toggle"' +
-        (allChecked ? ' checked' : '') + ' onchange="toggleUpstream(this)"> ' + esc(name) + ' (' + tools.length + ')</label></div>' +
-      tools.map(t =>
-        '<div class="tool-item"><label><input type="checkbox" data-upstream="' + esc(name) + '" data-tool="' + esc(t.name) + '"' +
-          (sel.includes(t.name) ? ' checked' : '') + '> ' + esc(t.name) + '</label></div>'
-      ).join('') +
-      '</div>';
-  }).join('');
+
+    const groupCb = el('input', {
+      type: 'checkbox',
+      className: 'upstream-toggle',
+      dataset: { upstream: name },
+    });
+    groupCb.checked = allChecked;
+    groupCb.addEventListener('change', () => toggleUpstream(name, groupCb.checked));
+
+    const header = el('div', { className: 'tool-picker-group-header' }, [
+      el('label', {}, [groupCb, ' ' + name + ' (' + tools.length + ')']),
+    ]);
+
+    const items = tools.map(t => {
+      const cb = el('input', {
+        type: 'checkbox',
+        dataset: { upstream: name, tool: t.name },
+      });
+      cb.checked = sel.includes(t.name);
+      return el('div', { className: 'tool-item' }, [
+        el('label', {}, [cb, ' ' + t.name]),
+      ]);
+    });
+
+    return el('div', { className: 'tool-picker-group' }, [header, ...items]);
+  }));
 }
 
-function toggleUpstream(el) {
-  const name = el.dataset.upstream;
-  const checked = el.checked;
-  document.querySelectorAll('#tool-picker input[data-upstream="' + name + '"][data-tool]').forEach(cb => cb.checked = checked);
+function toggleUpstream(name, checked) {
+  document.querySelectorAll('#tool-picker input[data-tool]').forEach(cb => {
+    if (cb.dataset.upstream === name) cb.checked = checked;
+  });
 }
 
 function getSelectedTools() {
@@ -351,6 +465,8 @@ function getSelectedTools() {
 async function saveProfile() {
   const name = document.getElementById('profile-name').value.trim();
   if (!name) { toast('Profile name is required', false); return; }
+  const btn = document.getElementById('modal-save');
+  btn.disabled = true;
   const allowed_tools = getSelectedTools();
   const body = JSON.stringify({ name, allowed_tools });
   const headers = { 'Content-Type': 'application/json' };
@@ -364,17 +480,10 @@ async function saveProfile() {
     closeModal();
     loadProfiles();
   } catch (e) { toast('Save failed: ' + e.message, false); }
-}
-
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+  finally { btn.disabled = false; }
 }
 
 // ── MCP Servers ──
-
-let editingServer = null;
 
 async function loadServers() {
   try {
@@ -386,27 +495,38 @@ async function loadServers() {
 function renderServers(servers) {
   const tb = document.getElementById('servers-body');
   document.getElementById('servers-empty').style.display = servers.length ? 'none' : 'block';
-  tb.closest('table').style.display = servers.length ? '' : 'none';
-  tb.innerHTML = servers.sort((a, b) => a.name.localeCompare(b.name)).map(s => {
-    const authInfo = (s.auth_prefix ? esc(s.auth_prefix) + ' ' : '') + '<code>' + esc(s.auth_header) + '</code>';
-    const source = s.from_config ? ' <span class="tag">config</span>' : '';
-    const logging = s.log_mcp_traffic ? ' <span class="tag">logging</span>' : '';
-    const actions = s.from_config
-      ? '<span style="color:#999;font-size:12px">from config</span>'
-      : '<div class="actions">' +
-          '<button class="btn btn-sm" onclick="openEditServer(\'' + esc(s.name) + '\')">Edit</button>' +
-          '<button class="btn btn-sm btn-danger" onclick="deleteServer(\'' + esc(s.name) + '\')">Delete</button>' +
-        '</div>';
-    const urlDisplay = s.url ? '<code>' + esc(s.url) + '</code>' : '<span style="color:#999">' + esc(s.transport) + '</span>';
-    return '<tr><td><strong>' + esc(s.name) + '</strong>' + source + logging + '</td>' +
-      '<td>' + urlDisplay + '</td>' +
-      '<td>' + authInfo + '</td>' +
-      '<td>' + actions + '</td></tr>';
-  }).join('');
+  document.getElementById('servers-table').style.display = servers.length ? '' : 'none';
+  const sorted = [...servers].sort((a, b) => a.name.localeCompare(b.name));
+  tb.replaceChildren(...sorted.map(s => {
+    const nameChildren = [el('strong', { text: s.name })];
+    if (s.from_config) nameChildren.push(' ', el('span', { className: 'tag', text: 'config' }));
+    if (s.log_mcp_traffic) nameChildren.push(' ', el('span', { className: 'tag', text: 'logging' }));
+    const nameCell = el('td', {}, nameChildren);
+
+    const urlCell = el('td', {}, [
+      s.url ? el('code', { text: s.url }) : el('span', { className: 'muted', text: s.transport }),
+    ]);
+
+    const authChildren = [];
+    if (s.auth_prefix) authChildren.push(s.auth_prefix + ' ');
+    authChildren.push(el('code', { text: s.auth_header }));
+    const authCell = el('td', {}, authChildren);
+
+    const actionsCell = el('td', {}, [
+      s.from_config
+        ? el('span', { className: 'muted', text: 'from config' })
+        : el('div', { className: 'actions' }, [
+            el('button', { type: 'button', className: 'btn btn-sm', text: 'Edit', onClick: () => openEditServer(s.name) }),
+            el('button', { type: 'button', className: 'btn btn-sm btn-danger', text: 'Delete', onClick: () => deleteServer(s.name) }),
+          ]),
+    ]);
+    return el('tr', {}, [nameCell, urlCell, authCell, actionsCell]);
+  }));
 }
 
 function openCreateServer() {
   editingServer = null;
+  editingExtraHeaders = [];
   document.getElementById('server-modal-title').textContent = 'Add MCP Server';
   document.getElementById('server-modal-save').textContent = 'Add';
   document.getElementById('server-name').value = '';
@@ -423,6 +543,7 @@ async function openEditServer(name) {
   try {
     const server = await api('/settings/servers/' + encodeURIComponent(name));
     editingServer = name;
+    editingExtraHeaders = Array.isArray(server.extra_headers) ? server.extra_headers : [];
     document.getElementById('server-modal-title').textContent = 'Edit MCP Server';
     document.getElementById('server-modal-save').textContent = 'Save';
     document.getElementById('server-name').value = server.name;
@@ -452,7 +573,10 @@ async function saveServer() {
   if (!url) { toast('URL is required', false); return; }
   if (!credential_ref) { toast('Credential reference is required', false); return; }
 
-  const body = JSON.stringify({ name, url, auth_header, auth_prefix, credential_ref, log_mcp_traffic });
+  const btn = document.getElementById('server-modal-save');
+  btn.disabled = true;
+  const extra_headers = editingServer ? editingExtraHeaders : [];
+  const body = JSON.stringify({ name, url, auth_header, auth_prefix, credential_ref, log_mcp_traffic, extra_headers });
   const headers = { 'Content-Type': 'application/json' };
   try {
     if (editingServer) {
@@ -463,9 +587,9 @@ async function saveServer() {
     toast((editingServer ? 'Updated ' : 'Added ') + name, true);
     closeServerModal();
     loadServers();
-    // Reload tools since the new server is now a live upstream
     loadTools();
   } catch (e) { toast('Save failed: ' + e.message, false); }
+  finally { btn.disabled = false; }
 }
 
 async function deleteServer(name) {
@@ -478,8 +602,51 @@ async function deleteServer(name) {
   } catch (e) { toast('Delete failed: ' + e.message, false); }
 }
 
-// ── Init ──
-loadTools().then(() => { loadProfiles(); loadServers(); });
+function loadAll() {
+  return loadTools().then(() => Promise.all([loadProfiles(), loadServers()]));
+}
+
+// ── Event wiring & Init ──
+document.getElementById('refresh-all-btn').addEventListener('click', refreshAllTools);
+document.getElementById('add-server-btn').addEventListener('click', openCreateServer);
+document.getElementById('new-profile-btn').addEventListener('click', openCreateProfile);
+
+document.getElementById('profile-modal-close').addEventListener('click', closeModal);
+document.getElementById('profile-modal-cancel').addEventListener('click', closeModal);
+document.getElementById('modal-save').addEventListener('click', saveProfile);
+document.getElementById('profile-overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+document.getElementById('server-modal-close').addEventListener('click', closeServerModal);
+document.getElementById('server-modal-cancel').addEventListener('click', closeServerModal);
+document.getElementById('server-modal-save').addEventListener('click', saveServer);
+document.getElementById('server-overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeServerModal();
+});
+
+document.getElementById('admin-token-save').addEventListener('click', () => {
+  const val = document.getElementById('admin-token-input').value.trim();
+  if (!val) return;
+  sessionStorage.setItem(TOKEN_STORAGE_KEY, val);
+  document.getElementById('admin-token-input').value = '';
+  showAuthBanner(false);
+  loadAll();
+});
+document.getElementById('admin-token-clear').addEventListener('click', () => {
+  sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  document.getElementById('admin-token-input').value = '';
+  showAuthBanner(true);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeModal();
+    closeServerModal();
+  }
+});
+
+loadAll();
 </script>
 </body>
 </html>
