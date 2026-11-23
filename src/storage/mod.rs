@@ -84,15 +84,16 @@ fn default_encrypted_file_path() -> PathBuf {
 
 pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
     use anyhow::Context;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
-            || format!("failed to set permissions on directory: {}", dir.display()),
-        )?;
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
+    builder
+        .create(dir)
+        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     Ok(())
 }
 
@@ -142,6 +143,32 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::expand_tilde;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writes_preserve_existing_dirs_and_secure_new_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shared = std::env::temp_dir().join(format!(
+            "mcp-auth-proxy-permissions-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        super::write_private_atomic(&shared.join("tokens.enc"), b"tokens").unwrap();
+        let nested = shared.join("app/nested");
+        super::write_private_atomic(&nested.join("tokens.enc"), b"tokens").unwrap();
+
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&shared), 0o755);
+        assert_eq!(mode(&shared.join("app")), 0o700);
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&shared.join("tokens.enc")), 0o600);
+        assert_eq!(mode(&nested.join("tokens.enc")), 0o600);
+        std::fs::remove_dir_all(shared).unwrap();
+    }
 
     #[test]
     fn expands_leading_tilde_in_paths() {
