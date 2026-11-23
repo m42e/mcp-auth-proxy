@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
@@ -5,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use http::{header, HeaderName, HeaderValue, Method};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use reqwest::Client;
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -16,17 +18,38 @@ use crate::mcp_protocol::{
     MODERN_PROTOCOL_VERSION,
 };
 
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// HTTP upstream transport — forwards requests to an HTTP MCP server.
 pub struct HttpUpstream {
     client: Client,
     base_url: String,
+    base_has_non_root_path: bool,
     upstream_name: String,
     log_mcp_traffic: bool,
 }
 
 impl HttpUpstream {
     pub fn new(upstream_name: String, base_url: String, log_mcp_traffic: bool) -> Result<Self> {
+        let parsed = url::Url::parse(&base_url)
+            .with_context(|| format!("invalid HTTP upstream URL: {base_url}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            anyhow::bail!("HTTP upstream URL must use http or https with a host");
+        }
+        let base_has_non_root_path = !parsed.path().is_empty() && parsed.path() != "/";
+
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to create HTTP client for upstream")?;
 
@@ -36,6 +59,7 @@ impl HttpUpstream {
         Ok(Self {
             client,
             base_url,
+            base_has_non_root_path,
             upstream_name,
             log_mcp_traffic,
         })
@@ -55,39 +79,51 @@ impl HttpUpstream {
         let query = request.uri().query();
 
         // Build upstream URL
-        let upstream_url = if let Some(q) = query {
-            format!("{}{}?{}", self.base_url, path, q)
-        } else {
-            format!("{}{}", self.base_url, path)
-        };
+        let upstream_url =
+            build_upstream_url(&self.base_url, self.base_has_non_root_path, path, query);
 
         debug!(url = %upstream_url, method = %method, "forwarding to HTTP upstream");
 
         // Build upstream request
-        let mut upstream_req = self.client.request(convert_method(&method), &upstream_url);
+        let mut upstream_req = self.client.request(convert_method(&method)?, &upstream_url);
 
-        // Forward headers (except Host and Connection)
+        // Strip hop-by-hop, client auth/cookie, and injected auth headers before forwarding.
         let headers = request.headers();
+        let req_connection_headers = connection_nominated_headers(headers);
         for (name, value) in headers.iter() {
-            if name == header::HOST || name == header::CONNECTION {
+            let name_lower = name.as_str().to_ascii_lowercase();
+            if should_strip_request_header(&name_lower, &req_connection_headers, auth_headers) {
                 continue;
             }
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
-                if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                    upstream_req = upstream_req.header(name, value);
-                }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                upstream_req = upstream_req.header(name, value);
             }
         }
 
-        // Inject auth headers
+        // Inject auth headers (replace semantics — client headers with same names were stripped).
         for (name, value) in auth_headers {
-            upstream_req = upstream_req.header(name.as_str(), value.as_str());
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid configured auth header name '{name}'"))?;
+            let header_value = HeaderValue::from_str(value)
+                .with_context(|| format!("invalid auth header value for '{name}'"))?;
+            upstream_req = upstream_req.header(header_name, header_value);
         }
 
         // Forward body
-        let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-            .await
-            .context("failed to read request body")?;
+        let body_bytes = match axum::body::to_bytes(request.into_body(), MAX_HTTP_BODY_BYTES).await
+        {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds maximum allowed size",
+                )
+                    .into_response());
+            }
+        };
 
         if self.log_mcp_traffic {
             mcp_logging::log_request(&self.upstream_name, "http", &body_bytes);
@@ -109,22 +145,25 @@ impl HttpUpstream {
 
         // Check if this is a streaming response (SSE)
         let is_sse = resp_headers
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|ct| ct.contains("text/event-stream"))
             .unwrap_or(false);
 
         let mut response_builder = Response::builder().status(status.as_u16());
 
-        // Forward response headers
+        // Forward response headers (strip hop-by-hop and Set-Cookie headers)
+        let resp_connection_headers = connection_nominated_headers(&resp_headers);
         for (name, value) in resp_headers.iter() {
-            if name == reqwest::header::TRANSFER_ENCODING {
+            let name_lower = name.as_str().to_ascii_lowercase();
+            if should_strip_response_header(&name_lower, &resp_connection_headers) {
                 continue;
             }
-            if let Ok(name) = HeaderName::from_bytes(name.as_str().as_bytes()) {
-                if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
-                    response_builder = response_builder.header(name, value);
-                }
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                response_builder = response_builder.header(name, value);
             }
         }
 
@@ -133,7 +172,7 @@ impl HttpUpstream {
             debug!("streaming SSE response from upstream");
             if self.log_mcp_traffic {
                 let content_type = resp_headers
-                    .get(reqwest::header::CONTENT_TYPE)
+                    .get(header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok());
                 mcp_logging::log_streaming_response(
                     &self.upstream_name,
@@ -146,38 +185,99 @@ impl HttpUpstream {
                 .bytes_stream()
                 .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
             let body = Body::from_stream(stream);
-            Ok(response_builder.body(body).unwrap().into_response())
+            response_builder
+                .body(body)
+                .context("failed to build SSE response")
         } else {
-            // Buffer non-streaming responses
-            let body_bytes = upstream_resp
-                .bytes()
-                .await
-                .context("failed to read upstream response body")?;
+            // Buffer non-streaming responses with size bound
+            let body_bytes = read_bounded_body(upstream_resp, MAX_HTTP_BODY_BYTES).await?;
             if self.log_mcp_traffic {
                 mcp_logging::log_response(
                     &self.upstream_name,
                     "http",
                     Some(status.as_u16()),
-                    body_bytes.as_ref(),
+                    &body_bytes,
                 );
             }
             let body = Body::from(body_bytes);
-            Ok(response_builder.body(body).unwrap().into_response())
+            response_builder
+                .body(body)
+                .context("failed to build upstream response")
         }
     }
 }
 
-fn convert_method(method: &Method) -> reqwest::Method {
-    match *method {
-        Method::GET => reqwest::Method::GET,
-        Method::POST => reqwest::Method::POST,
-        Method::PUT => reqwest::Method::PUT,
-        Method::DELETE => reqwest::Method::DELETE,
-        Method::PATCH => reqwest::Method::PATCH,
-        Method::HEAD => reqwest::Method::HEAD,
-        Method::OPTIONS => reqwest::Method::OPTIONS,
-        _ => reqwest::Method::GET,
+fn build_upstream_url(
+    base_url: &str,
+    base_has_non_root_path: bool,
+    path: &str,
+    query: Option<&str>,
+) -> String {
+    let joined = if path == "/" && base_has_non_root_path {
+        base_url.to_string()
+    } else {
+        format!("{base_url}{path}")
+    };
+    match query {
+        Some(q) => format!("{joined}?{q}"),
+        None => joined,
     }
+}
+
+fn connection_nominated_headers(headers: &HeaderMap) -> HashSet<String> {
+    let mut nominated = HashSet::new();
+    for value in headers.get_all(header::CONNECTION) {
+        if let Ok(value_str) = value.to_str() {
+            for token in value_str.split(',') {
+                let token = token.trim().to_ascii_lowercase();
+                if !token.is_empty() {
+                    nominated.insert(token);
+                }
+            }
+        }
+    }
+    nominated
+}
+
+fn should_strip_request_header(
+    name_lower: &str,
+    connection_headers: &HashSet<String>,
+    auth_headers: &[(String, String)],
+) -> bool {
+    matches!(
+        name_lower,
+        "host" | "content-length" | "cookie" | "accept-encoding" | "authorization"
+    ) || HOP_BY_HOP_HEADERS.contains(&name_lower)
+        || connection_headers.contains(name_lower)
+        || auth_headers
+            .iter()
+            .any(|(auth_name, _)| auth_name.eq_ignore_ascii_case(name_lower))
+}
+
+fn should_strip_response_header(name_lower: &str, connection_headers: &HashSet<String>) -> bool {
+    name_lower == "set-cookie"
+        || HOP_BY_HOP_HEADERS.contains(&name_lower)
+        || connection_headers.contains(name_lower)
+}
+
+async fn read_bounded_body(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("failed to read upstream response body")?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("upstream response body exceeds {max_bytes} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+fn convert_method(method: &Method) -> Result<reqwest::Method> {
+    reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .with_context(|| format!("unsupported HTTP method: {method}"))
 }
 
 impl HttpUpstream {
@@ -479,4 +579,67 @@ fn ensure_success(reply: &HttpRpcReply, response: &Value, method: &str) -> Resul
         anyhow::bail!("{} failed with HTTP {}: {}", method, reply.status, detail);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_upstream_url, connection_nominated_headers, convert_method,
+        should_strip_request_header, should_strip_response_header, HttpUpstream,
+    };
+    use http::{header, HeaderMap, HeaderValue, Method};
+
+    #[test]
+    fn builds_upstream_url_without_spurious_trailing_slash() {
+        assert_eq!(
+            build_upstream_url("https://mcp.context7.com/mcp", true, "/", None),
+            "https://mcp.context7.com/mcp"
+        );
+        assert_eq!(
+            build_upstream_url("https://mcp.context7.com/mcp", true, "/", Some("a=1")),
+            "https://mcp.context7.com/mcp?a=1"
+        );
+        assert_eq!(
+            build_upstream_url("https://mcp.context7.com/mcp", true, "/sse", None),
+            "https://mcp.context7.com/mcp/sse"
+        );
+        assert_eq!(
+            build_upstream_url("https://mcp.example.com", false, "/", None),
+            "https://mcp.example.com/"
+        );
+    }
+
+    #[test]
+    fn strips_sensitive_and_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("x-hop, TE"));
+        let conn = connection_nominated_headers(&headers);
+        let auth = vec![("X-Custom-Auth".to_string(), "secret".to_string())];
+
+        assert!(should_strip_request_header("authorization", &conn, &auth));
+        assert!(should_strip_request_header("cookie", &conn, &auth));
+        assert!(should_strip_request_header("accept-encoding", &conn, &auth));
+        assert!(should_strip_request_header("x-custom-auth", &conn, &auth));
+        assert!(should_strip_request_header("x-hop", &conn, &auth));
+        assert!(!should_strip_request_header("mcp-session-id", &conn, &auth));
+
+        assert!(should_strip_response_header("set-cookie", &conn));
+        assert!(should_strip_response_header("transfer-encoding", &conn));
+        assert!(should_strip_response_header("x-hop", &conn));
+        assert!(!should_strip_response_header("content-type", &conn));
+    }
+
+    #[test]
+    fn rejects_invalid_upstream_url_schemes() {
+        assert!(HttpUpstream::new("bad".into(), "file:///etc/passwd".into(), false).is_err());
+        assert!(
+            HttpUpstream::new("ok".into(), "https://mcp.example.com/mcp".into(), false).is_ok()
+        );
+    }
+
+    #[test]
+    fn preserves_custom_http_methods() {
+        let m = Method::from_bytes(b"PROPFIND").unwrap();
+        assert_eq!(convert_method(&m).unwrap().as_str(), "PROPFIND");
+    }
 }
