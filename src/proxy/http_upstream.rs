@@ -14,7 +14,9 @@ use tracing::{debug, warn};
 
 use crate::mcp_logging;
 use crate::mcp_protocol::{
-    latest_legacy_version, modern_request, supported_versions, LATEST_LEGACY_PROTOCOL_VERSION,
+    evaluate_discovery_response, extract_tools_result, initialized_notification,
+    legacy_initialize_request, legacy_tools_list_request, modern_request,
+    parse_sse_jsonrpc_messages, DiscoveryOutcome, LATEST_LEGACY_PROTOCOL_VERSION,
     MODERN_PROTOCOL_VERSION,
 };
 
@@ -292,66 +294,28 @@ impl HttpUpstream {
             .post_jsonrpc(&discover, auth_headers, Some(MODERN_PROTOCOL_VERSION), None)
             .await?;
 
-        let response = parse_jsonrpc_response(&reply).ok();
-        let method_not_found = response
-            .as_ref()
-            .and_then(|value| value.pointer("/error/code"))
-            .and_then(Value::as_i64)
-            == Some(-32601);
         if reply.status == reqwest::StatusCode::UNAUTHORIZED
             || reply.status == reqwest::StatusCode::FORBIDDEN
         {
             anyhow::bail!("MCP discovery failed with HTTP {}", reply.status);
         }
 
-        if let Some(response) = response {
-            if let Some(error) = response.get("error") {
-                let error_code = error.get("code").and_then(Value::as_i64);
-                if error_code == Some(-32022) {
-                    let versions = supported_versions(&response);
-                    if let Some(legacy_version) =
-                        latest_legacy_version(versions.iter().map(String::as_str))
-                    {
-                        return self.fetch_legacy_tools(auth_headers, legacy_version).await;
-                    }
-                    anyhow::bail!(
-                        "upstream does not support MCP protocol version {}; supported versions: {}",
-                        MODERN_PROTOCOL_VERSION,
-                        versions.join(", ")
-                    );
-                }
-
-                if error_code.is_some_and(|code| (-32099..=-32020).contains(&code)) {
-                    anyhow::bail!("MCP discovery failed: {error}");
-                }
-
-                if reply.status.is_success() && error_code != Some(-32601) {
-                    anyhow::bail!("MCP discovery failed: {error}");
-                }
-            } else if reply.status.is_success() {
-                let versions = supported_versions(&response);
-                if versions.iter().any(|v| v == MODERN_PROTOCOL_VERSION) {
-                    if response.pointer("/result/capabilities/tools").is_some() {
+        if let Ok(response) = parse_jsonrpc_response(&reply) {
+            if reply.status.is_success() || response.get("error").is_some() {
+                match evaluate_discovery_response(&response)? {
+                    DiscoveryOutcome::ModernWithTools => {
                         return self
                             .fetch_modern_tools(auth_headers, MODERN_PROTOCOL_VERSION)
                             .await;
                     }
-                    return Ok(Vec::new());
+                    DiscoveryOutcome::ModernNoTools => return Ok(Vec::new()),
+                    DiscoveryOutcome::Legacy(version) => {
+                        return self.fetch_legacy_tools(auth_headers, version).await;
+                    }
+                    DiscoveryOutcome::MethodNotFound => {}
                 }
-
-                if let Some(legacy_version) =
-                    latest_legacy_version(versions.iter().map(String::as_str))
-                {
-                    return self.fetch_legacy_tools(auth_headers, legacy_version).await;
-                }
-
-                anyhow::bail!(
-                    "MCP discovery returned no supported protocol version compatible with this proxy"
-                );
             }
-        }
-
-        if !reply.status.is_client_error() && !(reply.status.is_success() && method_not_found) {
+        } else if !reply.status.is_client_error() {
             anyhow::bail!(
                 "MCP discovery failed with HTTP {}: {}",
                 reply.status,
@@ -381,11 +345,7 @@ impl HttpUpstream {
             )
         })?;
         ensure_success(&reply, &response, "tools/list")?;
-        Ok(response
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        extract_tools_result(&response, "tools/list")
     }
 
     async fn fetch_legacy_tools(
@@ -393,19 +353,7 @@ impl HttpUpstream {
         auth_headers: &[(String, String)],
         version: &str,
     ) -> Result<Vec<Value>> {
-        let init_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "protocolVersion": version,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "mcp-auth-proxy",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }
-        });
+        let init_body = legacy_initialize_request(serde_json::json!(1), version);
         let init_reply = self
             .post_jsonrpc(&init_body, auth_headers, None, None)
             .await?;
@@ -427,10 +375,7 @@ impl HttpUpstream {
         let legacy_version_header =
             (negotiated_version >= "2025-06-18").then_some(negotiated_version);
 
-        let notif_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        });
+        let notif_body = initialized_notification();
         let notif_reply = self
             .post_jsonrpc(&notif_body, auth_headers, legacy_version_header, session_id)
             .await?;
@@ -438,11 +383,7 @@ impl HttpUpstream {
             warn!(status = %notif_reply.status, "initialized notification returned non-success status");
         }
 
-        let tools_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "tools/list",
-            "id": 2,
-        });
+        let tools_body = legacy_tools_list_request(serde_json::json!(2));
         let tools_reply = self
             .post_jsonrpc(&tools_body, auth_headers, legacy_version_header, session_id)
             .await?;
@@ -453,11 +394,7 @@ impl HttpUpstream {
             )
         })?;
         ensure_success(&tools_reply, &response, "tools/list")?;
-        Ok(response
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        extract_tools_result(&response, "tools/list")
     }
 
     async fn post_jsonrpc(
@@ -549,25 +486,10 @@ fn parse_jsonrpc_response(reply: &HttpRpcReply) -> Result<Value> {
         return serde_json::from_slice(&reply.body).context("response body is not valid JSON");
     }
 
-    let text = String::from_utf8_lossy(&reply.body);
-    let mut data_lines = Vec::new();
-    for line in text.lines().chain(std::iter::once("")) {
-        if line.is_empty() {
-            if !data_lines.is_empty() {
-                let data = data_lines.join("\n");
-                data_lines.clear();
-                if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                    if value.get("id").is_some() || value.get("error").is_some() {
-                        return Ok(value);
-                    }
-                }
-            }
-        } else if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_string());
-        }
-    }
-
-    anyhow::bail!("SSE response did not contain a JSON-RPC response")
+    parse_sse_jsonrpc_messages(&reply.body)
+        .into_iter()
+        .find(|value| value.get("id").is_some() || value.get("error").is_some())
+        .ok_or_else(|| anyhow::anyhow!("SSE response did not contain a JSON-RPC response"))
 }
 
 fn ensure_success(reply: &HttpRpcReply, response: &Value, method: &str) -> Result<()> {

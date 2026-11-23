@@ -18,8 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::mcp_logging;
 use crate::mcp_protocol::{
-    latest_legacy_version, modern_request, supported_versions, LATEST_LEGACY_PROTOCOL_VERSION,
-    MODERN_PROTOCOL_VERSION,
+    evaluate_discovery_response, extract_tools_result, initialized_notification,
+    legacy_initialize_request, legacy_tools_list_request, modern_request, DiscoveryOutcome,
+    LATEST_LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION,
 };
 
 const MAX_STDIO_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -828,11 +829,7 @@ impl StdioUpstream {
             serde_json::json!("discover-1000000"),
             MODERN_PROTOCOL_VERSION,
         );
-        if self.log_mcp_traffic {
-            let payload = serde_json::to_vec(&discover)
-                .context("failed to serialize server/discover request")?;
-            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
-        }
+        self.log_json_request(&discover, "server/discover")?;
         let discovery = match self
             .send_jsonrpc_with_timeout(&discover, std::time::Duration::from_secs(3))
             .await
@@ -845,41 +842,16 @@ impl StdioUpstream {
         };
 
         if let Some(response) = discovery.as_ref() {
-            let versions = supported_versions(response);
-            if response.get("error").is_some()
-                && response.pointer("/error/code").and_then(Value::as_i64) == Some(-32022)
-            {
-                if versions.iter().any(|v| v == MODERN_PROTOCOL_VERSION) {
+            match evaluate_discovery_response(response) {
+                Ok(DiscoveryOutcome::ModernWithTools) => {
                     return self.fetch_modern_tools(MODERN_PROTOCOL_VERSION).await;
                 }
-                if let Some(version) = latest_legacy_version(versions.iter().map(String::as_str)) {
+                Ok(DiscoveryOutcome::ModernNoTools) => return Ok(Vec::new()),
+                Ok(DiscoveryOutcome::Legacy(version)) => {
                     return self.fetch_legacy_tools(version).await;
                 }
-                anyhow::bail!(
-                    "upstream does not support MCP protocol version {}; supported versions: {}",
-                    MODERN_PROTOCOL_VERSION,
-                    versions.join(", ")
-                );
-            }
-
-            if response.get("error").is_none()
-                && response
-                    .pointer("/result/supportedVersions")
-                    .and_then(Value::as_array)
-                    .is_some()
-            {
-                if versions.iter().any(|v| v == MODERN_PROTOCOL_VERSION) {
-                    if response.pointer("/result/capabilities/tools").is_some() {
-                        return self.fetch_modern_tools(MODERN_PROTOCOL_VERSION).await;
-                    }
-                    return Ok(Vec::new());
-                }
-                if let Some(version) = latest_legacy_version(versions.iter().map(String::as_str)) {
-                    return self.fetch_legacy_tools(version).await;
-                }
-                anyhow::bail!(
-                    "MCP discovery returned no protocol version compatible with this proxy"
-                );
+                Ok(DiscoveryOutcome::MethodNotFound) => {}
+                Err(error) => return Err(error),
             }
         }
 
@@ -890,55 +862,22 @@ impl StdioUpstream {
     async fn fetch_modern_tools(&self, version: &str) -> Result<Vec<Value>> {
         let tools_request =
             modern_request("tools/list", serde_json::json!("tools-1000002"), version);
-        if self.log_mcp_traffic {
-            let payload = serde_json::to_vec(&tools_request)
-                .context("failed to serialize modern tools/list request")?;
-            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
-        }
+        self.log_json_request(&tools_request, "modern tools/list")?;
 
         let response = self.send_jsonrpc(&tools_request).await?;
-        if response.get("error").is_some() {
-            anyhow::bail!(
-                "modern tools/list failed: {}",
-                response.get("error").unwrap()
-            );
-        }
-
-        Ok(response
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        extract_tools_result(&response, "modern tools/list")
     }
 
     async fn fetch_legacy_tools(&self, version: &str) -> Result<Vec<Value>> {
-        let init_msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "id": 1000001,
-            "params": {
-                "protocolVersion": version,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "mcp-auth-proxy",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        });
-
-        if self.log_mcp_traffic {
-            let payload =
-                serde_json::to_vec(&init_msg).context("failed to serialize initialize request")?;
-            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
-        }
+        let init_msg = legacy_initialize_request(serde_json::json!(1000001), version);
+        self.log_json_request(&init_msg, "initialize")?;
 
         let init_resp = self.send_jsonrpc(&init_msg).await?;
-        if init_resp.get("error").is_some() {
-            anyhow::bail!("initialize failed: {}", init_resp.get("error").unwrap());
+        if let Some(err) = init_resp.get("error") {
+            anyhow::bail!("initialize failed: {err}");
         }
 
         // Step 2: notifications/initialized (no id → notification)
-        // We must send this directly since send_jsonrpc expects an id.
         self.ensure_process().await?;
         {
             let mut proc_guard = self.process.lock().await;
@@ -946,19 +885,9 @@ impl StdioUpstream {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("stdio process not available"))?;
 
-            let notif = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            });
-            if self.log_mcp_traffic {
-                let payload = serde_json::to_vec(&notif)
-                    .context("failed to serialize initialized notification")?;
-                mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
-            }
-            let notif_bytes = serde_json::to_vec(&notif)?;
-            managed.stdin.write_all(&notif_bytes).await?;
-            managed.stdin.write_all(b"\n").await?;
-            managed.stdin.flush().await?;
+            let notif = initialized_notification();
+            self.log_json_request(&notif, "initialized notification")?;
+            write_json_line(&mut managed.stdin, &notif).await?;
         }
 
         if self.log_mcp_traffic {
@@ -966,31 +895,20 @@ impl StdioUpstream {
         }
 
         // Step 3: tools/list
-        let tools_msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "tools/list",
-            "id": 1000002
-        });
-
-        if self.log_mcp_traffic {
-            let payload =
-                serde_json::to_vec(&tools_msg).context("failed to serialize tools/list request")?;
-            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
-        }
+        let tools_msg = legacy_tools_list_request(serde_json::json!(1000002));
+        self.log_json_request(&tools_msg, "tools/list")?;
 
         let tools_resp = self.send_jsonrpc(&tools_msg).await?;
-        if tools_resp.get("error").is_some() {
-            anyhow::bail!("tools/list failed: {}", tools_resp.get("error").unwrap());
+        extract_tools_result(&tools_resp, "tools/list")
+    }
+
+    fn log_json_request(&self, msg: &Value, label: &str) -> Result<()> {
+        if self.log_mcp_traffic {
+            let payload = serde_json::to_vec(msg)
+                .with_context(|| format!("failed to serialize {label} request"))?;
+            mcp_logging::log_request(&self.upstream_name, "stdio", &payload);
         }
-
-        let tools = tools_resp
-            .get("result")
-            .and_then(|r| r.get("tools"))
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        Ok(tools)
+        Ok(())
     }
 }
 

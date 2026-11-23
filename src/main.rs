@@ -134,7 +134,9 @@ async fn main() -> Result<()> {
 
         let http = match upstream_config.transport {
             TransportType::Http => {
-                let url = upstream_config.url.as_ref().unwrap();
+                let url = upstream_config.url.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("upstream '{}': missing url", upstream_config.name)
+                })?;
                 Some(proxy::http_upstream::HttpUpstream::new(
                     upstream_route_name.clone(),
                     url.clone(),
@@ -146,7 +148,13 @@ async fn main() -> Result<()> {
 
         let stdio = match upstream_config.transport {
             TransportType::Stdio => {
-                let command = upstream_config.command.as_ref().unwrap().clone();
+                let command = upstream_config
+                    .command
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("upstream '{}': missing command", upstream_config.name)
+                    })?
+                    .clone();
                 Some(proxy::stdio_upstream::StdioUpstream::new(
                     upstream_route_name.clone(),
                     command,

@@ -1145,16 +1145,10 @@ async fn filter_tools_list_response(response: Response, allowed_tools: &[String]
     let events = text
         .split("\n\n")
         .map(|event| {
-            let mut data_lines = Vec::new();
-            let mut message = None;
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    data_lines.push(data.strip_prefix(' ').unwrap_or(data));
-                }
-            }
-            if !data_lines.is_empty() {
-                message = serde_json::from_str::<Value>(&data_lines.join("\n")).ok();
-            }
+            let data = crate::mcp_protocol::event_data_string(event);
+            let message = (!data.is_empty())
+                .then(|| serde_json::from_str::<Value>(&data).ok())
+                .flatten();
 
             if let Some(mut message) = message {
                 if filter_tools_in_message(&mut message, allowed_tools) {
@@ -1223,22 +1217,7 @@ fn filter_tools_in_message(msg: &mut Value, allowed_tools: &[String]) -> bool {
 }
 
 fn sse_jsonrpc_messages(body: &[u8]) -> Vec<Value> {
-    let text = String::from_utf8_lossy(body).replace("\r\n", "\n");
-    text.split("\n\n")
-        .filter_map(|event| {
-            let data = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(|line| line.strip_prefix(' ').unwrap_or(line))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() {
-                None
-            } else {
-                serde_json::from_str::<Value>(&data).ok()
-            }
-        })
-        .collect()
+    crate::mcp_protocol::parse_sse_jsonrpc_messages(body)
 }
 
 async fn do_proxy(upstream: &UpstreamState, request: Request<Body>) -> anyhow::Result<Response> {
