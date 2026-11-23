@@ -1,6 +1,8 @@
 pub mod encrypted_file;
 pub mod keychain;
 
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use tracing::warn;
@@ -48,20 +50,54 @@ fn create_storage_by_type(
             Ok(Box::new(store))
         }
         StorageType::EncryptedFile => {
-            let path = config
-                .encrypted_file
-                .as_ref()
+            let encrypted_cfg = config.encrypted_file.as_ref();
+            let path = encrypted_cfg
                 .and_then(|c| c.path.clone())
+                .map(expand_tilde)
                 .unwrap_or_else(default_encrypted_file_path);
-            let store = encrypted_file::EncryptedFileStorage::new(path)?;
+            let key_env = encrypted_cfg.and_then(|c| c.key_env.as_deref());
+            let store = encrypted_file::EncryptedFileStorage::with_key_env(path, key_env)?;
             Ok(Box::new(store))
         }
     }
 }
 
-fn default_encrypted_file_path() -> std::path::PathBuf {
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    if path == Path::new("~") {
+        return dirs::home_dir().unwrap_or(path);
+    }
+    if let Ok(rest) = path.strip_prefix("~") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path
+}
+
+fn default_encrypted_file_path() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("mcp-auth-proxy")
         .join("tokens.enc")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tilde;
+    use std::path::PathBuf;
+
+    #[test]
+    fn expands_leading_tilde_in_paths() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde(PathBuf::from("~")), home);
+            assert_eq!(
+                expand_tilde(PathBuf::from("~/.config/mcp-auth-proxy/tokens.enc")),
+                home.join(".config/mcp-auth-proxy/tokens.enc")
+            );
+        }
+        assert_eq!(
+            expand_tilde(PathBuf::from("/var/lib/tokens.enc")),
+            PathBuf::from("/var/lib/tokens.enc")
+        );
+    }
 }

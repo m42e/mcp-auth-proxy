@@ -193,6 +193,8 @@ pub enum StorageType {
 #[derive(Debug, Deserialize)]
 pub struct EncryptedFileConfig {
     pub path: Option<PathBuf>,
+    /// Optional environment variable name providing the token-encryption secret
+    pub key_env: Option<String>,
 }
 
 impl Config {
