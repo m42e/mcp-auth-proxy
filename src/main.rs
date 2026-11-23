@@ -64,12 +64,34 @@ async fn main() -> Result<()> {
     // Validate mode — test connectivity and exit
     if cli.validate {
         info!("validation mode — testing credential provider");
+        let mut failures = 0usize;
+        if let Some(ref token_ref) = config.server.admin_token_ref {
+            match credential_provider.resolve(token_ref).await {
+                Ok(_) => info!("server admin token resolution OK"),
+                Err(e) => {
+                    failures += 1;
+                    error!(error = %e, "server admin token resolution FAILED");
+                }
+            }
+        }
         for upstream in &config.upstreams {
             if let Some(ref cred_ref) = upstream.auth.credential_ref {
                 match credential_provider.resolve(cred_ref).await {
                     Ok(_) => info!(upstream = %upstream.name, "credential resolution OK"),
                     Err(e) => {
-                        error!(upstream = %upstream.name, error = %e, "credential resolution FAILED")
+                        failures += 1;
+                        error!(upstream = %upstream.name, error = %e, "credential resolution FAILED");
+                    }
+                }
+            }
+            for extra in &upstream.auth.extra_headers {
+                match credential_provider.resolve(&extra.credential_ref).await {
+                    Ok(_) => {
+                        info!(upstream = %upstream.name, header = %extra.header, "extra header credential resolution OK")
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        error!(upstream = %upstream.name, header = %extra.header, error = %e, "extra header credential resolution FAILED");
                     }
                 }
             }
@@ -82,10 +104,14 @@ async fn main() -> Result<()> {
                 match credential_provider.resolve(secret_ref).await {
                     Ok(_) => info!(upstream = %upstream.name, "OAuth client-secret resolution OK"),
                     Err(e) => {
-                        error!(upstream = %upstream.name, error = %e, "OAuth client-secret resolution FAILED")
+                        failures += 1;
+                        error!(upstream = %upstream.name, error = %e, "OAuth client-secret resolution FAILED");
                     }
                 }
             }
+        }
+        if failures > 0 {
+            anyhow::bail!("validation failed with {failures} error(s)");
         }
         info!("validation complete");
         return Ok(());

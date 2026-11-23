@@ -76,30 +76,44 @@ fn resolve_keepass(
     }
 
     let db = Database::open(&mut db_file, key).context("failed to unlock KeePass database")?;
+    resolve_from_group(&db.root, reference)
+}
 
-    // Parse reference: "group/entry/field" or "entry" or "group/entry"
+fn resolve_from_group(root: &keepass::db::Group, reference: &str) -> Result<String> {
+    if reference.is_empty() || reference.split('/').any(str::is_empty) {
+        anyhow::bail!("invalid KeePass reference '{reference}'");
+    }
+
     let parts: Vec<&str> = reference.split('/').collect();
-    let (group_path, entry_name, field_name) = match parts.len() {
-        1 => (None, parts[0], "Password"),
-        2 => (None, parts[0], parts[1]),
+    match parts.len() {
+        1 => find_entry_field(root, parts[0], "Password"),
+        2 => {
+            // Documented format is `group/entry` (Password field). Fall back to
+            // root-level `entry/field` only if the group/entry lookup fails.
+            if let Some(group) = find_group(root, parts[0]) {
+                if let Ok(value) = find_entry_field(group, parts[1], "Password") {
+                    return Ok(value);
+                }
+            }
+            find_entry_field(root, parts[0], parts[1])
+        }
         _ => {
             let field = *parts.last().unwrap();
             let entry = parts[parts.len() - 2];
-            let group = parts[..parts.len() - 2].join("/");
-            (Some(group), entry, field)
+            let group_path = parts[..parts.len() - 2].join("/");
+            let group = find_group(root, &group_path)
+                .with_context(|| format!("KeePass group '{}' not found", group_path))?;
+            find_entry_field(group, entry, field)
         }
-    };
+    }
+}
 
-    // Search the database
-    let root = &db.root;
-    let search_group = if let Some(ref gp) = group_path {
-        find_group(root, gp).with_context(|| format!("KeePass group '{}' not found", gp))?
-    } else {
-        root
-    };
-
-    // Find entry by title
-    for node in &search_group.children {
+fn find_entry_field(
+    group: &keepass::db::Group,
+    entry_name: &str,
+    field_name: &str,
+) -> Result<String> {
+    for node in &group.children {
         if let keepass::db::Node::Entry(entry) = node {
             if entry.get_title() == Some(entry_name) {
                 let value = match field_name {
@@ -144,4 +158,47 @@ fn find_group<'a>(group: &'a keepass::db::Group, path: &str) -> Option<&'a keepa
     }
 
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_from_group;
+    use keepass::db::{Entry, Group, Node, Value};
+
+    fn make_entry(title: &str, user: &str, pass: &str) -> Node {
+        let mut entry = Entry::new();
+        entry
+            .fields
+            .insert("Title".into(), Value::Unprotected(title.into()));
+        entry
+            .fields
+            .insert("UserName".into(), Value::Unprotected(user.into()));
+        entry
+            .fields
+            .insert("Password".into(), Value::Unprotected(pass.into()));
+        Node::Entry(entry)
+    }
+
+    #[test]
+    fn resolves_one_two_and_three_part_keepass_references() {
+        let mut root = Group::new("Root");
+        root.children.push(make_entry("root-item", "u1", "p1"));
+
+        let mut subgroup = Group::new("Work");
+        subgroup.children.push(make_entry("api", "u2", "p2"));
+        root.children.push(Node::Group(subgroup));
+
+        assert_eq!(resolve_from_group(&root, "root-item").unwrap(), "p1");
+        assert_eq!(resolve_from_group(&root, "Work/api").unwrap(), "p2");
+        assert_eq!(
+            resolve_from_group(&root, "root-item/Username").unwrap(),
+            "u1"
+        );
+        assert_eq!(
+            resolve_from_group(&root, "Work/api/Username").unwrap(),
+            "u2"
+        );
+        assert!(resolve_from_group(&root, "").is_err());
+        assert!(resolve_from_group(&root, "Work//api").is_err());
+    }
 }

@@ -24,11 +24,8 @@ impl OnePasswordProvider {
 #[async_trait]
 impl CredentialProvider for OnePasswordProvider {
     async fn resolve(&self, reference: &str) -> Result<String> {
-        if !reference.starts_with("op://") {
-            anyhow::bail!(
-                "1Password reference must start with 'op://', got: {}",
-                reference
-            );
+        if !reference.starts_with("op://") || reference.contains(['\r', '\n', '\0']) {
+            anyhow::bail!("1Password reference must be a valid single-line 'op://' reference");
         }
 
         debug!(reference, "resolving 1Password credential");
@@ -54,6 +51,6 @@ impl CredentialProvider for OnePasswordProvider {
         let secret =
             String::from_utf8(output.stdout).context("1Password returned non-UTF-8 output")?;
 
-        Ok(secret.trim_end().to_string())
+        Ok(secret.trim_end_matches(&['\r', '\n'][..]).to_string())
     }
 }

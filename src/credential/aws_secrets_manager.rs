@@ -153,6 +153,10 @@ fn extract_secret_value(secret_string: &str, field_path: Option<&str>) -> Result
 
     match current {
         Value::String(value) => Ok(value.clone()),
+        Value::Null => anyhow::bail!(
+            "AWS Secrets Manager JSON field '{}' resolved to null",
+            field_path
+        ),
         value => {
             serde_json::to_string(value).context("failed to serialize non-string JSON secret field")
         }
@@ -189,5 +193,11 @@ mod tests {
         let secret = r#"{"token":{"ttl":3600}}"#;
         let value = extract_secret_value(secret, Some("token")).unwrap();
         assert_eq!(value, r#"{"ttl":3600}"#);
+    }
+
+    #[test]
+    fn rejects_null_json_field() {
+        let secret = r#"{"token":null}"#;
+        assert!(extract_secret_value(secret, Some("token")).is_err());
     }
 }
