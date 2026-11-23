@@ -9,7 +9,7 @@ fi
 
 VERSION="$1"
 
-if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+if ! printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
   echo "Error: version must be in semver format (X.Y.Z)"
   exit 1
 fi
@@ -19,14 +19,22 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
   echo "Error: tag v${VERSION} already exists"
   exit 1
 fi
 
 echo "Updating Cargo.toml to version ${VERSION}..."
-sed -i.bak 's/^version = ".*"/version = "'"${VERSION}"'"/' Cargo.toml
-rm -f Cargo.toml.bak
+awk -v ver="$VERSION" '
+  /^\[/ { in_pkg = ($0 ~ /^\[package\]([[:space:]]*(#.*)?)?$/) }
+  in_pkg && !done && /^version[[:space:]]*=/ {
+    $0 = "version = \"" ver "\""
+    done = 1
+  }
+  { print }
+  END { if (!done) exit 1 }
+' Cargo.toml > Cargo.toml.tmp || { rm -f Cargo.toml.tmp; exit 1; }
+mv Cargo.toml.tmp Cargo.toml
 
 echo "Updating Cargo.lock..."
 cargo update -w

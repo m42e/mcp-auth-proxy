@@ -25,30 +25,48 @@ jobs:
       - name: Read version from Cargo.toml
         id: version
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(awk '
+            /^\[/ { in_pkg = ($0 ~ /^\[package\]([[:space:]]*(#.*)?)?$/) }
+            in_pkg && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, "")
+              sub(/".*/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+          if ! printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid package version in Cargo.toml: $VERSION"
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected version: $VERSION"
 
       - name: Verify branch name matches version
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          DETECTED_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          BRANCH="${{ github.event.pull_request.head.ref }}"
-          EXPECTED="release/v${{ steps.version.outputs.version }}"
+          EXPECTED="release/v${DETECTED_VERSION}"
           if [ "$BRANCH" != "$EXPECTED" ]; then
             echo "::error::Branch name '$BRANCH' does not match expected '$EXPECTED'"
             exit 1
           fi
 
       - name: Verify tag does not exist
+        env:
+          DETECTED_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
+          TAG="v${DETECTED_VERSION}"
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::Tag $TAG already exists"
             exit 1
           fi
 
       - name: Create and push tag
+        env:
+          DETECTED_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
+          TAG="v${DETECTED_VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG"
@@ -56,6 +74,7 @@ jobs:
 
       - name: Dispatch release workflow
         run: |
-          gh workflow run release.yml -f tag="v${{ steps.version.outputs.version }}"
+          gh workflow run release.yml -f tag="v${DETECTED_VERSION}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DETECTED_VERSION: ${{ steps.version.outputs.version }}

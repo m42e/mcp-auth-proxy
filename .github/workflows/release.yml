@@ -57,7 +57,19 @@ jobs:
       - name: Verify tag matches crate version
         shell: bash
         run: |
-          CRATE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if ! printf '%s\n' "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Release tag '$RELEASE_TAG' must match vX.Y.Z"
+            exit 1
+          fi
+          CRATE_VERSION=$(awk '
+            /^\[/ { in_pkg = ($0 ~ /^\[package\]([[:space:]]*(#.*)?)?$/) }
+            in_pkg && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, "")
+              sub(/".*/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
           TAG_VERSION="${RELEASE_TAG#v}"
           if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::Crate version ($CRATE_VERSION) does not match tag version ($TAG_VERSION)"
@@ -65,22 +77,31 @@ jobs:
           fi
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          ARCHIVE_NAME="mcp-auth-proxy-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ARCHIVE_NAME" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
+          ARCHIVE_NAME="mcp-auth-proxy-${RELEASE_TAG}-${TARGET}.tar.gz"
+          tar -czf "$ARCHIVE_NAME" -C "target/${TARGET}/release" "${BINARY}"
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          $archiveName = "mcp-auth-proxy-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath $archiveName
-          echo "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
+          $archiveName = "mcp-auth-proxy-$($env:RELEASE_TAG)-$($env:TARGET).zip"
+          Compress-Archive -Path "target/$($env:TARGET)/release/$($env:BINARY)" -DestinationPath $archiveName
+          "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
