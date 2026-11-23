@@ -1003,42 +1003,63 @@ fn enforce_profile_request(
     allowed_tools: &[String],
     profile_name: &str,
 ) -> Option<Response> {
-    for item in jsonrpc_items(msg) {
-        if item.get("method").and_then(Value::as_str) != Some("tools/call") {
-            continue;
-        }
-        let Some(tool_name) = item
-            .get("params")
-            .and_then(|p| p.get("name"))
-            .and_then(Value::as_str)
-        else {
-            let error_resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": item.get("id"),
-                "error": {
-                    "code": -32602,
-                    "message": "tools/call requires string params.name"
+    let checked: Vec<_> = jsonrpc_items(msg)
+        .into_iter()
+        .map(|item| {
+            let error = if item.get("method").and_then(Value::as_str) != Some("tools/call") {
+                None
+            } else {
+                match item.pointer("/params/name").and_then(Value::as_str) {
+                    None => Some(serde_json::json!({
+                        "code": -32602,
+                        "message": "tools/call requires string params.name"
+                    })),
+                    Some(name) if !allowed_tools.iter().any(|allowed| allowed == name) => {
+                        Some(serde_json::json!({
+                            "code": -32601,
+                            "message": format!(
+                                "tool '{}' is not allowed in profile '{}'", name, profile_name
+                            )
+                        }))
+                    }
+                    Some(_) => None,
                 }
-            });
-            return Some((StatusCode::OK, Json(error_resp)).into_response());
-        };
+            };
+            (item, error)
+        })
+        .collect();
 
-        if !allowed_tools.iter().any(|allowed| allowed == tool_name) {
-            let error_resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": item.get("id"),
-                "error": {
-                    "code": -32601,
-                    "message": format!(
-                        "tool '{}' is not allowed in profile '{}'",
-                        tool_name, profile_name
-                    )
-                }
-            });
-            return Some((StatusCode::OK, Json(error_resp)).into_response());
-        }
+    if !checked.iter().any(|(_, error)| error.is_some()) {
+        return None;
     }
-    None
+
+    // Reject the entire batch before forwarding anything, accounting for every
+    // request ID. Notifications can trigger rejection but never receive a response.
+    let responses: Vec<Value> = checked
+        .into_iter()
+        .filter_map(|(item, error)| {
+            let id = item.get("id")?;
+            Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": error.unwrap_or_else(|| serde_json::json!({
+                    "code": -32000,
+                    "message": "batch rejected because another call violates profile restrictions"
+                }))
+            }))
+        })
+        .collect();
+
+    if responses.is_empty() {
+        Some(StatusCode::ACCEPTED.into_response())
+    } else {
+        let body = if msg.is_array() {
+            Value::Array(responses)
+        } else {
+            responses.into_iter().next().unwrap()
+        };
+        Some((StatusCode::OK, Json(body)).into_response())
+    }
 }
 
 /// Intercept a tools/list JSON or SSE response and update the tool cache.
@@ -1319,6 +1340,69 @@ mod tests {
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "read_docs"}}
         ]);
         assert!(enforce_profile_request(&ok_batch, &allowed, "readonly").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_batches_respond_to_every_request_and_omit_notifications() {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": "allowed", "method": "tools/call", "params": {"name": "read"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "delete"}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "delete"}}
+        ]);
+        let response = enforce_profile_request(&batch, &["read".into()], "readonly").unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let responses = body.as_array().unwrap();
+        assert_eq!(responses.len(), 4);
+        for (response, id) in responses
+            .iter()
+            .zip([json!(1), json!("allowed"), json!(2), json!(3)])
+        {
+            assert_eq!(response["id"], id);
+            assert!(response.get("error").is_some());
+        }
+        assert_eq!(body[0]["error"]["code"], -32000);
+        assert_eq!(body[1]["error"]["code"], -32000);
+        assert_eq!(body[2]["error"]["code"], -32601);
+        assert_eq!(body[3]["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn forbidden_notifications_reject_batches_without_notification_responses() {
+        let notification =
+            json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "delete"}});
+        for msg in [notification.clone(), json!([notification.clone()])] {
+            let response = enforce_profile_request(&msg, &[], "readonly").unwrap();
+            assert_eq!(response.status(), http::StatusCode::ACCEPTED);
+            assert!(axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        let mixed = json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, notification]);
+        let response = enforce_profile_request(&mixed, &[], "readonly").unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["id"], 1);
+        assert_eq!(body[0]["error"]["code"], -32000);
+
+        let single = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}});
+        let response = enforce_profile_request(&single, &[], "readonly").unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.is_object());
+        assert_eq!(body["id"], 2);
+        assert_eq!(body["error"]["code"], -32602);
     }
 
     #[test]
