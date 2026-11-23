@@ -209,6 +209,7 @@ impl StdioUpstream {
                                     let progress_token =
                                         msg.pointer("/params/progressToken").cloned();
                                     let subscription_request = if let Some(id) = subscription_id {
+                                        let pending = pending_clone.read().await;
                                         pending.get(&id).map(|request| {
                                             (
                                                 request.sender.clone(),
@@ -217,6 +218,7 @@ impl StdioUpstream {
                                             )
                                         })
                                     } else if let Some(token) = progress_token {
+                                        let pending = pending_clone.read().await;
                                         pending
                                             .values()
                                             .find(|request| {

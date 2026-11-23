@@ -449,7 +449,7 @@ impl OAuthAuth {
             .ok_or_else(|| anyhow::anyhow!("OAuth callback missing 'state' parameter"))?;
 
         // Verify CSRF state
-        if received_state != csrf_state.secret() {
+        if received_state != *csrf_state.secret() {
             anyhow::bail!("OAuth CSRF state mismatch — possible attack");
         }
 
