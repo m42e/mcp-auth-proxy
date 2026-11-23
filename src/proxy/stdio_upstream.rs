@@ -134,7 +134,8 @@ impl StdioUpstream {
 
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args);
-        cmd.envs(&self.env);
+        cmd.env_clear();
+        cmd.envs(build_child_env(std::env::vars(), &self.env));
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::inherit());
@@ -886,5 +887,123 @@ impl StdioUpstream {
             .unwrap_or_default();
 
         Ok(tools)
+    }
+}
+
+const SAFE_INHERITED_ENV_VARS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "USERNAME",
+    "SHELL",
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "NPM_CONFIG_CACHE",
+    "UV_CACHE_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "PATHEXT",
+    "OS",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "WINDIR",
+];
+
+/// Filter inherited parent environment variables to a safe allowlist and merge explicit overrides.
+fn build_child_env<I>(
+    parent_vars: I,
+    extra_env: &HashMap<String, String>,
+) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut env: HashMap<String, String> = parent_vars
+        .into_iter()
+        .filter(|(key, _)| {
+            SAFE_INHERITED_ENV_VARS
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        })
+        .collect();
+    for (key, value) in extra_env {
+        env.insert(key.clone(), value.clone());
+    }
+    env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_child_env;
+    use std::collections::HashMap;
+
+    #[test]
+    fn strips_parent_vault_secrets_from_child_env() {
+        let parent = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/test".to_string()),
+            (
+                "http_proxy".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ),
+            (
+                "OP_SERVICE_ACCOUNT_TOKEN".to_string(),
+                "op-secret".to_string(),
+            ),
+            ("BW_SESSION".to_string(), "bw-session".to_string()),
+            ("BW_PASSWORD".to_string(), "bw-pass".to_string()),
+            ("KEEPASS_PASSWORD".to_string(), "kp-pass".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "aws-secret".to_string(),
+            ),
+            ("AWS_SESSION_TOKEN".to_string(), "aws-token".to_string()),
+        ];
+        let mut extra = HashMap::new();
+        extra.insert("CUSTOM_API_KEY".to_string(), "explicit".to_string());
+        extra.insert("HOME".to_string(), "/override".to_string());
+
+        let child_env = build_child_env(parent, &extra);
+
+        assert_eq!(child_env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(
+            child_env.get("http_proxy").map(String::as_str),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(child_env.get("HOME").map(String::as_str), Some("/override"));
+        assert_eq!(
+            child_env.get("CUSTOM_API_KEY").map(String::as_str),
+            Some("explicit")
+        );
+        assert!(!child_env.contains_key("OP_SERVICE_ACCOUNT_TOKEN"));
+        assert!(!child_env.contains_key("BW_SESSION"));
+        assert!(!child_env.contains_key("BW_PASSWORD"));
+        assert!(!child_env.contains_key("KEEPASS_PASSWORD"));
+        assert!(!child_env.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!child_env.contains_key("AWS_SESSION_TOKEN"));
     }
 }
