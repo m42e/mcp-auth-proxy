@@ -11,7 +11,7 @@ use axum::{
 use bytes::Bytes;
 use http::StatusCode;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -21,6 +21,8 @@ use crate::mcp_protocol::{
     latest_legacy_version, modern_request, supported_versions, LATEST_LEGACY_PROTOCOL_VERSION,
     MODERN_PROTOCOL_VERSION,
 };
+
+const MAX_STDIO_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stdio upstream transport — bridges HTTP to a child process speaking JSON-RPC over stdio.
 pub struct StdioUpstream {
@@ -34,15 +36,42 @@ pub struct StdioUpstream {
 }
 
 struct ManagedProcess {
-    child: Child,
+    child: Option<Child>,
     stdin: tokio::io::BufWriter<tokio::process::ChildStdin>,
     pending: Arc<RwLock<HashMap<Value, PendingRequest>>>,
-    _reader_handle: tokio::task::JoinHandle<()>,
+    reader_handle: tokio::task::JoinHandle<()>,
+}
+
+impl ManagedProcess {
+    async fn shutdown(mut self) {
+        self.reader_handle.abort();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        self.reader_handle.abort();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            if matches!(child.try_wait(), Ok(None)) {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                }
+            }
+        }
+    }
 }
 
 struct PendingRequest {
     sender: tokio::sync::mpsc::UnboundedSender<Value>,
     source_id: Value,
+    client_session: Option<String>,
     progress_token: Option<Value>,
     source_progress_token: Option<Value>,
 }
@@ -61,29 +90,103 @@ impl Drop for StdioCancelGuard {
 
         let process = self.process.clone();
         let request_id = self.request_id.clone();
-        let cancel = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": {
-                "requestId": request_id.clone(),
-                "reason": "HTTP response stream closed",
-            }
-        });
 
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let mut process = process.lock().await;
-                if let Some(managed) = process.as_mut() {
-                    let _ = managed.pending.write().await.remove(&request_id);
-                    if let Ok(bytes) = serde_json::to_vec(&cancel) {
-                        let _ = managed.stdin.write_all(&bytes).await;
-                        let _ = managed.stdin.write_all(b"\n").await;
-                        let _ = managed.stdin.flush().await;
-                    }
-                }
+                cancel_request(
+                    &process,
+                    &request_id,
+                    true,
+                    Some("HTTP response stream closed"),
+                )
+                .await;
             });
         }
     }
+}
+
+async fn cancel_request(
+    process: &Arc<Mutex<Option<ManagedProcess>>>,
+    upstream_request_id: &Value,
+    send_notification: bool,
+    reason: Option<&str>,
+) {
+    let mut process = process.lock().await;
+    if let Some(managed) = process.as_mut() {
+        let _ = managed.pending.write().await.remove(upstream_request_id);
+        if send_notification {
+            let mut params = serde_json::json!({ "requestId": upstream_request_id });
+            if let Some(reason) = reason {
+                params["reason"] = Value::String(reason.to_string());
+            }
+            let cancel = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": params,
+            });
+            let _ = write_json_line(&mut managed.stdin, &cancel).await;
+        }
+    }
+}
+
+async fn write_json_line(
+    stdin: &mut tokio::io::BufWriter<tokio::process::ChildStdin>,
+    message: &Value,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(message).context("failed to serialize message")?;
+    stdin
+        .write_all(&bytes)
+        .await
+        .context("failed to write to stdio upstream stdin")?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .context("failed to write newline to stdio upstream stdin")?;
+    stdin
+        .flush()
+        .await
+        .context("failed to flush stdio upstream stdin")?;
+    Ok(())
+}
+
+async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let n = reader
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', buf)
+        .await?;
+    if buf.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stdio message exceeded {max_bytes} bytes"),
+        ));
+    }
+    Ok(n)
+}
+
+fn json_response(status: StatusCode, body: Vec<u8>) -> Result<Response> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .context("failed to build JSON response")
+}
+
+fn sse_response<S>(stream: S) -> Result<Response>
+where
+    S: futures_util::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .context("failed to build SSE response")
 }
 
 impl StdioUpstream {
@@ -116,14 +219,17 @@ impl StdioUpstream {
         if proc_guard.is_some() {
             // Check if still alive
             if let Some(ref mut managed) = *proc_guard {
-                match managed.child.try_wait() {
-                    Ok(Some(status)) => {
+                match managed.child.as_mut().map(|child| child.try_wait()) {
+                    Some(Ok(Some(status))) => {
                         warn!(status = %status, "stdio child process exited — restarting");
                         *proc_guard = None;
                     }
-                    Ok(None) => return Ok(()), // Still running
-                    Err(e) => {
+                    Some(Ok(None)) => return Ok(()), // Still running
+                    Some(Err(e)) => {
                         warn!(error = %e, "failed to check child process status — restarting");
+                        *proc_guard = None;
+                    }
+                    None => {
                         *proc_guard = None;
                     }
                 }
@@ -167,16 +273,19 @@ impl StdioUpstream {
         let log_mcp_traffic = self.log_mcp_traffic;
         let reader_handle = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
+            let mut line_buf = Vec::new();
 
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
+                match read_bounded_line(&mut reader, &mut line_buf, MAX_STDIO_MESSAGE_BYTES).await {
                     Ok(0) => {
                         debug!("stdio upstream stdout closed");
                         break;
                     }
                     Ok(_) => {
+                        let Ok(line) = std::str::from_utf8(&line_buf) else {
+                            warn!("stdio upstream emitted non-UTF-8 line");
+                            continue;
+                        };
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
@@ -284,10 +393,10 @@ impl StdioUpstream {
         });
 
         *proc_guard = Some(ManagedProcess {
-            child,
+            child: Some(child),
             stdin,
             pending,
-            _reader_handle: reader_handle,
+            reader_handle,
         });
 
         Ok(())
@@ -307,10 +416,22 @@ impl StdioUpstream {
             .and_then(|value| value.to_str().ok())
             .map(|value| value.contains("text/event-stream"))
             .unwrap_or(false);
+        let client_session = parts
+            .headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
 
-        let body_bytes = axum::body::to_bytes(body, usize::MAX)
-            .await
-            .context("failed to read request body")?;
+        let body_bytes = match axum::body::to_bytes(body, MAX_STDIO_MESSAGE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds maximum allowed size",
+                )
+                    .into_response());
+            }
+        };
 
         if body_bytes.is_empty() {
             return Ok((StatusCode::BAD_REQUEST, "empty request body").into_response());
@@ -331,6 +452,7 @@ impl StdioUpstream {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let cancellable = !matches!(method, "initialize" | "server/discover");
         let cancelled_request_id = (method == "notifications/cancelled")
             .then(|| msg.pointer("/params/requestId").cloned())
             .flatten();
@@ -351,7 +473,9 @@ impl StdioUpstream {
             let mut pending = managed.pending.write().await;
             if let Some(upstream_id) = pending
                 .iter()
-                .find(|(_, request)| request.source_id == cancelled_id)
+                .find(|(_, request)| {
+                    request.source_id == cancelled_id && request.client_session == client_session
+                })
                 .map(|(upstream_id, _)| upstream_id.clone())
             {
                 let _ = pending.remove(&upstream_id);
@@ -372,6 +496,7 @@ impl StdioUpstream {
                 PendingRequest {
                     sender: tx,
                     source_id: source_id.clone(),
+                    client_session,
                     progress_token: source_progress_token.as_ref().map(|_| upstream_id.clone()),
                     source_progress_token,
                 },
@@ -382,22 +507,7 @@ impl StdioUpstream {
         };
 
         // Write message to stdin
-        let msg_bytes = serde_json::to_vec(&msg).context("failed to serialize message")?;
-        managed
-            .stdin
-            .write_all(&msg_bytes)
-            .await
-            .context("failed to write to stdio upstream stdin")?;
-        managed
-            .stdin
-            .write_all(b"\n")
-            .await
-            .context("failed to write newline to stdio upstream stdin")?;
-        managed
-            .stdin
-            .flush()
-            .await
-            .context("failed to flush stdio upstream stdin")?;
+        write_json_line(&mut managed.stdin, &msg).await?;
 
         drop(proc_guard); // Release lock while waiting for response
 
@@ -409,9 +519,15 @@ impl StdioUpstream {
             return Ok((StatusCode::ACCEPTED, "").into_response());
         }
 
-        let mut rx = rx.unwrap();
-        let source_request_id = request_id.unwrap();
-        let upstream_request_id = upstream_request_id.unwrap();
+        let Some(mut rx) = rx else {
+            anyhow::bail!("missing response channel for request");
+        };
+        let Some(source_request_id) = request_id else {
+            anyhow::bail!("missing request id");
+        };
+        let Some(upstream_request_id) = upstream_request_id else {
+            anyhow::bail!("missing upstream request id");
+        };
 
         if stream_response {
             let completed = Arc::new(AtomicBool::new(false));
@@ -429,12 +545,7 @@ impl StdioUpstream {
                         let status = streamable_http_status(&msg, &message);
                         let body = serde_json::to_vec(&message)
                             .context("failed to serialize stdio response")?;
-                        return Ok(Response::builder()
-                            .status(status)
-                            .header("Content-Type", "application/json")
-                            .body(Body::from(body))
-                            .unwrap()
-                            .into_response());
+                        return json_response(status, body);
                     }
                     Ok(Some(message)) => Some(message),
                     Ok(None) => anyhow::bail!("stdio reader task dropped"),
@@ -451,6 +562,7 @@ impl StdioUpstream {
                     completed,
                     keepalive,
                     first_message,
+                    false,
                 ),
                 |(
                     mut rx,
@@ -459,7 +571,11 @@ impl StdioUpstream {
                     completed,
                     mut keepalive,
                     mut first_message,
+                    done,
                 )| async move {
+                    if done {
+                        return None;
+                    }
                     let message = if let Some(message) = first_message.take() {
                         message
                     } else {
@@ -478,6 +594,7 @@ impl StdioUpstream {
                                         completed,
                                         keepalive,
                                         first_message,
+                                        false,
                                     ),
                                 ));
                             }
@@ -485,7 +602,8 @@ impl StdioUpstream {
                             Some(None) => return None,
                         }
                     };
-                    if message.get("id") == Some(&source_request_id) {
+                    let is_final = message.get("id") == Some(&source_request_id);
+                    if is_final {
                         completed.store(true, Ordering::Release);
                     }
                     let data = match serde_json::to_string(&message) {
@@ -500,6 +618,7 @@ impl StdioUpstream {
                                     completed,
                                     keepalive,
                                     first_message,
+                                    true,
                                 ),
                             ));
                         }
@@ -513,22 +632,16 @@ impl StdioUpstream {
                             completed,
                             keepalive,
                             first_message,
+                            is_final,
                         ),
                     ))
                 },
             );
 
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/event-stream")
-                .header("Cache-Control", "no-cache")
-                .header("X-Accel-Buffering", "no")
-                .body(Body::from_stream(stream))
-                .unwrap()
-                .into_response());
+            return sse_response(stream);
         }
 
-        let response_msg = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let response_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 let message = rx
                     .recv()
@@ -539,18 +652,30 @@ impl StdioUpstream {
                 }
             }
         })
-        .await
-        .context("timeout waiting for stdio upstream response")??;
+        .await;
+
+        let response_msg = match response_result {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => {
+                cancel_request(&self.process, &upstream_request_id, false, None).await;
+                return Err(error);
+            }
+            Err(_) => {
+                cancel_request(
+                    &self.process,
+                    &upstream_request_id,
+                    cancellable,
+                    Some("request timed out"),
+                )
+                .await;
+                anyhow::bail!("timeout waiting for stdio upstream response");
+            }
+        };
 
         let response_body =
             serde_json::to_vec(&response_msg).context("failed to serialize response")?;
 
-        Ok(Response::builder()
-            .status(streamable_http_status(&msg, &response_msg))
-            .header("Content-Type", "application/json")
-            .body(Body::from(response_body))
-            .unwrap()
-            .into_response())
+        json_response(streamable_http_status(&msg, &response_msg), response_body)
     }
 }
 
@@ -582,14 +707,12 @@ impl Drop for StdioUpstream {
     fn drop(&mut self) {
         // Best-effort process cleanup
         if let Some(process) = Arc::get_mut(&mut self.process) {
-            if let Some(mut managed) = process.get_mut().take() {
-                let _ = managed.child.start_kill();
-            }
+            drop(process.get_mut().take());
         } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let process = self.process.clone();
             runtime.spawn(async move {
-                if let Some(mut managed) = process.lock().await.take() {
-                    let _ = managed.child.start_kill();
+                if let Some(managed) = process.lock().await.take() {
+                    managed.shutdown().await;
                 }
             });
         }
@@ -597,6 +720,11 @@ impl Drop for StdioUpstream {
 }
 
 impl StdioUpstream {
+    async fn shutdown(&self) {
+        if let Some(managed) = self.process.lock().await.take() {
+            managed.shutdown().await;
+        }
+    }
     /// Send a JSON-RPC message and wait for the response.
     pub async fn send_jsonrpc(&self, msg: &Value) -> Result<Value> {
         self.send_jsonrpc_with_timeout(msg, std::time::Duration::from_secs(30))
@@ -638,6 +766,7 @@ impl StdioUpstream {
             PendingRequest {
                 sender: tx,
                 source_id: source_request_id.clone(),
+                client_session: None,
                 progress_token: source_progress_token
                     .as_ref()
                     .map(|_| upstream_request_id.clone()),
@@ -645,22 +774,7 @@ impl StdioUpstream {
             },
         );
 
-        let msg_bytes = serde_json::to_vec(&outgoing).context("failed to serialize message")?;
-        managed
-            .stdin
-            .write_all(&msg_bytes)
-            .await
-            .context("failed to write to stdin")?;
-        managed
-            .stdin
-            .write_all(b"\n")
-            .await
-            .context("failed to write newline")?;
-        managed
-            .stdin
-            .flush()
-            .await
-            .context("failed to flush stdin")?;
+        write_json_line(&mut managed.stdin, &outgoing).await?;
 
         drop(proc_guard);
 
@@ -679,24 +793,12 @@ impl StdioUpstream {
 
         let response = match response_result {
             Ok(Ok(response)) => response,
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => {
+                cancel_request(&self.process, &upstream_request_id, false, None).await;
+                return Err(error);
+            }
             Err(_) => {
-                let mut proc_guard = self.process.lock().await;
-                if let Some(managed) = proc_guard.as_mut() {
-                    let _ = managed.pending.write().await.remove(&upstream_request_id);
-                    if cancellable {
-                        let cancel = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "notifications/cancelled",
-                            "params": { "requestId": upstream_request_id }
-                        });
-                        if let Ok(bytes) = serde_json::to_vec(&cancel) {
-                            let _ = managed.stdin.write_all(&bytes).await;
-                            let _ = managed.stdin.write_all(b"\n").await;
-                            let _ = managed.stdin.flush().await;
-                        }
-                    }
-                }
+                cancel_request(&self.process, &upstream_request_id, cancellable, None).await;
                 anyhow::bail!("timeout waiting for response")
             }
         };
@@ -715,7 +817,9 @@ impl StdioUpstream {
             self.env.clone(),
             self.log_mcp_traffic,
         );
-        discovery_process.fetch_tools_on_process().await
+        let result = discovery_process.fetch_tools_on_process().await;
+        discovery_process.shutdown().await;
+        result
     }
 
     async fn fetch_tools_on_process(&self) -> Result<Vec<Value>> {
@@ -958,8 +1062,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::build_child_env;
+    use super::{build_child_env, read_bounded_line, streamable_http_status};
+    use crate::mcp_protocol::MODERN_PROTOCOL_VERSION;
+    use http::StatusCode;
     use std::collections::HashMap;
+    use tokio::io::BufReader;
 
     #[test]
     fn strips_parent_vault_secrets_from_child_env() {
@@ -1005,5 +1112,52 @@ mod tests {
         assert!(!child_env.contains_key("KEEPASS_PASSWORD"));
         assert!(!child_env.contains_key("AWS_SECRET_ACCESS_KEY"));
         assert!(!child_env.contains_key("AWS_SESSION_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_rejects_oversized_messages() {
+        let data = b"{\"ok\":true}\n{\"too_big\":\"0123456789\"}\n";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+
+        let n = read_bounded_line(&mut reader, &mut buf, 16).await.unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(buf, b"{\"ok\":true}\n");
+
+        let err = read_bounded_line(&mut reader, &mut buf, 16)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn maps_modern_error_codes_to_http_status() {
+        let modern_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION
+                }
+            }
+        });
+        let err_missing = serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601}});
+        assert_eq!(
+            streamable_http_status(&modern_req, &err_missing),
+            StatusCode::NOT_FOUND
+        );
+
+        let err_proto = serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32022}});
+        assert_eq!(
+            streamable_http_status(&modern_req, &err_proto),
+            StatusCode::BAD_REQUEST
+        );
+
+        let legacy_req = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"});
+        assert_eq!(
+            streamable_http_status(&legacy_req, &err_missing),
+            StatusCode::OK
+        );
     }
 }
