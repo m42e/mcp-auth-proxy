@@ -12,6 +12,7 @@ use super::CredentialProvider;
 /// - Interactive `op` CLI with biometric unlock
 ///
 /// References use the `op://` format: `op://vault/item/field`
+#[derive(Default)]
 pub struct OnePasswordProvider;
 
 impl OnePasswordProvider {
@@ -50,8 +51,8 @@ impl CredentialProvider for OnePasswordProvider {
             anyhow::bail!("1Password `op read` failed: {}", stderr.trim());
         }
 
-        let secret = String::from_utf8(output.stdout)
-            .context("1Password returned non-UTF-8 output")?;
+        let secret =
+            String::from_utf8(output.stdout).context("1Password returned non-UTF-8 output")?;
 
         Ok(secret.trim_end().to_string())
     }

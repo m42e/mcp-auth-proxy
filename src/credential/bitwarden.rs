@@ -13,6 +13,7 @@ use super::CredentialProvider;
 /// - Interactive unlock
 ///
 /// References are item search terms (name, ID, or URI).
+#[derive(Default)]
 pub struct BitwardenProvider;
 
 impl BitwardenProvider {
@@ -79,9 +80,7 @@ impl BitwardenProvider {
             }
 
             warn!("Bitwarden vault is locked and no BW_PASSWORD env var set");
-            anyhow::bail!(
-                "Bitwarden vault is locked. Set BW_PASSWORD env var or run `bw unlock`"
-            );
+            anyhow::bail!("Bitwarden vault is locked. Set BW_PASSWORD env var or run `bw unlock`");
         }
 
         // Vault is unlocked without a session token (might work for some commands)

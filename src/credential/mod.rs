@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use crate::config::CredentialProviderConfig;
 
 /// Trait for resolving credential references to actual secret values.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CredentialProvider: Send + Sync {
     /// Resolve a credential reference string to its secret value.

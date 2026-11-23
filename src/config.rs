@@ -96,7 +96,7 @@ pub enum AuthMethod {
     OAuth,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OAuthConfig {
     /// The OAuth authorization server URL (used for discovery)
     pub server_url: String,

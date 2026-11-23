@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::config::{StorageType, TokenStorageConfig};
 
 /// Trait for persisting OAuth tokens and DCR client credentials.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TokenStorage: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<String>>;

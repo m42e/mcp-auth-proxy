@@ -122,15 +122,7 @@ impl OAuthAuth {
         Ok(Self {
             upstream_name,
             header_name,
-            config: OAuthConfig {
-                server_url: config.server_url.clone(),
-                client_id: config.client_id.clone(),
-                client_secret_ref: config.client_secret_ref.clone(),
-                token_endpoint_auth_method: config.token_endpoint_auth_method.clone(),
-                scopes: config.scopes.clone(),
-                redirect_port: config.redirect_port,
-                client_name: config.client_name.clone(),
-            },
+            config: config.clone(),
             resource_url: canonical_resource_url(&resource_url)?,
             http_client,
             credential_provider,

@@ -55,9 +55,7 @@ impl TokenStorage for KeychainStorage {
         let value = value.to_string();
         tokio::task::spawn_blocking(move || {
             let entry = Self::entry(&key)?;
-            entry
-                .set_password(&value)
-                .context("keychain set failed")?;
+            entry.set_password(&value).context("keychain set failed")?;
             Ok(())
         })
         .await

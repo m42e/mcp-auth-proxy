@@ -36,8 +36,8 @@ impl AwsSecretsManagerProvider {
                     None => RegionProviderChain::default_provider(),
                 };
 
-                let mut loader = aws_config::defaults(BehaviorVersion::latest())
-                    .region(region_provider);
+                let mut loader =
+                    aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
 
                 if let Some(profile) = &self.profile {
                     loader = loader.profile_name(profile);
@@ -55,7 +55,10 @@ impl CredentialProvider for AwsSecretsManagerProvider {
     async fn resolve(&self, reference: &str) -> Result<String> {
         let (secret_id, field_path) = parse_reference(reference)?;
 
-        debug!(reference, secret_id, "resolving AWS Secrets Manager credential");
+        debug!(
+            reference,
+            secret_id, "resolving AWS Secrets Manager credential"
+        );
 
         let response = self
             .client()
@@ -64,7 +67,9 @@ impl CredentialProvider for AwsSecretsManagerProvider {
             .secret_id(secret_id)
             .send()
             .await
-            .with_context(|| format!("failed to fetch AWS Secrets Manager secret '{}'", secret_id))?;
+            .with_context(|| {
+                format!("failed to fetch AWS Secrets Manager secret '{}'", secret_id)
+            })?;
 
         if let Some(secret_string) = response.secret_string() {
             return extract_secret_value(secret_string, field_path);
@@ -129,8 +134,12 @@ fn extract_secret_value(secret_string: &str, field_path: Option<&str>) -> Result
         return Ok(secret_string.to_string());
     };
 
-    let secret_json: Value = serde_json::from_str(secret_string)
-        .with_context(|| format!("failed to parse JSON secret while resolving field '{}'", field_path))?;
+    let secret_json: Value = serde_json::from_str(secret_string).with_context(|| {
+        format!(
+            "failed to parse JSON secret while resolving field '{}'",
+            field_path
+        )
+    })?;
 
     let mut current = &secret_json;
     for field in field_path.split('.') {
@@ -144,8 +153,9 @@ fn extract_secret_value(secret_string: &str, field_path: Option<&str>) -> Result
 
     match current {
         Value::String(value) => Ok(value.clone()),
-        value => serde_json::to_string(value)
-            .context("failed to serialize non-string JSON secret field"),
+        value => {
+            serde_json::to_string(value).context("failed to serialize non-string JSON secret field")
+        }
     }
 }
 

@@ -70,7 +70,8 @@ fn resolve_keepass(
     if let Some(kf_path) = key_file {
         let mut kf = File::open(kf_path)
             .with_context(|| format!("failed to open KeePass key file: {}", kf_path.display()))?;
-        key = key.with_keyfile(&mut kf)
+        key = key
+            .with_keyfile(&mut kf)
             .context("failed to read KeePass key file")?;
     }
 
@@ -92,8 +93,7 @@ fn resolve_keepass(
     // Search the database
     let root = &db.root;
     let search_group = if let Some(ref gp) = group_path {
-        find_group(root, gp)
-            .with_context(|| format!("KeePass group '{}' not found", gp))?
+        find_group(root, gp).with_context(|| format!("KeePass group '{}' not found", gp))?
     } else {
         root
     };
@@ -123,10 +123,7 @@ fn resolve_keepass(
     anyhow::bail!("KeePass entry '{}' not found", entry_name)
 }
 
-fn find_group<'a>(
-    group: &'a keepass::db::Group,
-    path: &str,
-) -> Option<&'a keepass::db::Group> {
+fn find_group<'a>(group: &'a keepass::db::Group, path: &str) -> Option<&'a keepass::db::Group> {
     let parts: Vec<&str> = path.split('/').collect();
     let mut current = group;
 

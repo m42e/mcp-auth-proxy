@@ -51,10 +51,7 @@ async fn main() -> Result<()> {
 
     config.validate()?;
 
-    info!(
-        upstreams = config.upstreams.len(),
-        "loaded configuration"
-    );
+    info!(upstreams = config.upstreams.len(), "loaded configuration");
 
     // Create credential provider
     let credential_provider: Arc<dyn credential::CredentialProvider> =
@@ -71,7 +68,9 @@ async fn main() -> Result<()> {
             if let Some(ref cred_ref) = upstream.auth.credential_ref {
                 match credential_provider.resolve(cred_ref).await {
                     Ok(_) => info!(upstream = %upstream.name, "credential resolution OK"),
-                    Err(e) => error!(upstream = %upstream.name, error = %e, "credential resolution FAILED"),
+                    Err(e) => {
+                        error!(upstream = %upstream.name, error = %e, "credential resolution FAILED")
+                    }
                 }
             }
             if let Some(secret_ref) = upstream
@@ -82,7 +81,9 @@ async fn main() -> Result<()> {
             {
                 match credential_provider.resolve(secret_ref).await {
                     Ok(_) => info!(upstream = %upstream.name, "OAuth client-secret resolution OK"),
-                    Err(e) => error!(upstream = %upstream.name, error = %e, "OAuth client-secret resolution FAILED"),
+                    Err(e) => {
+                        error!(upstream = %upstream.name, error = %e, "OAuth client-secret resolution FAILED")
+                    }
                 }
             }
         }
@@ -93,7 +94,10 @@ async fn main() -> Result<()> {
     // Build upstream states
     let mut upstreams = Vec::new();
     for upstream_config in &config.upstreams {
-        let upstream_route_name = upstream_config.path_prefix.trim_start_matches('/').to_string();
+        let upstream_route_name = upstream_config
+            .path_prefix
+            .trim_start_matches('/')
+            .to_string();
         let auth_strategy = auth::create_auth_strategy(
             &upstream_config.auth,
             &upstream_config.name,
@@ -201,8 +205,7 @@ async fn main() -> Result<()> {
     }
 
     // Clone upstreams for background cache refresh
-    let upstreams_for_cache: Vec<Arc<proxy::UpstreamState>> =
-        upstreams.iter().cloned().collect();
+    let upstreams_for_cache: Vec<Arc<proxy::UpstreamState>> = upstreams.to_vec();
     let tool_cache_bg = tool_cache.clone();
 
     // Build router
@@ -232,10 +235,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    axum::serve(listener, app)
-        .await
-        .context("server error")?;
+    axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
 }
-

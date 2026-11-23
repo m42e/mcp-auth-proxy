@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -121,13 +121,16 @@ impl McpServerStore {
 // ── Persistence helpers ────────────────────────────────────────────
 
 /// Load a JSON file containing an array of items into a HashMap keyed by name.
-fn load_json_map<T>(path: &PathBuf, key_fn: fn(&T) -> String) -> HashMap<String, T>
+fn load_json_map<T>(path: &Path, key_fn: fn(&T) -> String) -> HashMap<String, T>
 where
     T: serde::de::DeserializeOwned,
 {
     match std::fs::read_to_string(path) {
         Ok(data) => match serde_json::from_str::<Vec<T>>(&data) {
-            Ok(items) => items.into_iter().map(|item| (key_fn(&item), item)).collect(),
+            Ok(items) => items
+                .into_iter()
+                .map(|item| (key_fn(&item), item))
+                .collect(),
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "failed to parse persisted data, starting empty");
                 HashMap::new()
@@ -138,7 +141,7 @@ where
 }
 
 /// Persist a HashMap of items to a JSON file (array of values).
-fn persist_json<T: Serialize>(path: &PathBuf, map: &HashMap<String, T>) {
+fn persist_json<T: Serialize>(path: &Path, map: &HashMap<String, T>) {
     let items: Vec<&T> = map.values().collect();
     match serde_json::to_string_pretty(&items) {
         Ok(data) => {

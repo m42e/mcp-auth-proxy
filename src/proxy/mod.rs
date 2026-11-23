@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     body::Body,
     extract::{Path, Request, State},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use http::StatusCode;
 use serde_json::Value;
@@ -59,10 +59,8 @@ pub fn build_router(
     credential_provider: Arc<dyn CredentialProvider>,
     token_storage: Arc<dyn TokenStorage>,
 ) -> Router {
-    let upstream_map: HashMap<String, Arc<UpstreamState>> = upstreams
-        .into_iter()
-        .map(|u| (u.name.clone(), u))
-        .collect();
+    let upstream_map: HashMap<String, Arc<UpstreamState>> =
+        upstreams.into_iter().map(|u| (u.name.clone(), u)).collect();
 
     let state = Arc::new(AppState {
         upstreams: RwLock::new(upstream_map),
@@ -91,20 +89,13 @@ pub fn build_router(
         )
         .route(
             "/settings/profiles/{name}",
-            get(get_profile)
-                .put(update_profile)
-                .delete(delete_profile),
+            get(get_profile).put(update_profile).delete(delete_profile),
         )
         // Settings API — MCP servers
-        .route(
-            "/settings/servers",
-            get(list_servers).post(create_server),
-        )
+        .route("/settings/servers", get(list_servers).post(create_server))
         .route(
             "/settings/servers/{name}",
-            get(get_server)
-                .put(update_server)
-                .delete(delete_server),
+            get(get_server).put(update_server).delete(delete_server),
         )
         // Everything else goes through the main router
         .fallback(root_handler)
@@ -356,7 +347,10 @@ async fn create_server(
         }
         Err(e) => {
             error!(error = %e, "failed to register MCP server");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to register server: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to register server: {}", e),
+            )
                 .into_response()
         }
     }
@@ -390,7 +384,10 @@ async fn update_server(
         }
         Err(e) => {
             error!(error = %e, "failed to update MCP server");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to update server: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to update server: {}", e),
+            )
                 .into_response()
         }
     }
@@ -484,8 +481,7 @@ async fn root_handler(State(state): State<Arc<AppState>>, request: Request<Body>
         if let Some(upstream) = state.upstreams.read().await.get(upstream_name) {
             let upstream = upstream.clone();
             let remaining = build_remaining_path(&segments[2..], &query);
-            return proxy_with_filter(&state, upstream, request, &remaining, Some(profile))
-                .await;
+            return proxy_with_filter(&state, upstream, request, &remaining, Some(profile)).await;
         }
         return not_found().into_response();
     }

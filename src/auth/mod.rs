@@ -11,6 +11,7 @@ use crate::credential::CredentialProvider;
 use crate::storage::TokenStorage;
 
 /// Trait for applying authentication to outgoing requests.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AuthStrategy: Send + Sync {
     /// Returns one or more (header-name, header-value) pairs to inject.

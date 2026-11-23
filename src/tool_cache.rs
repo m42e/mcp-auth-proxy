@@ -9,16 +9,14 @@ use crate::config::TransportType;
 use crate::proxy::UpstreamState;
 
 /// Caches the list of tools exposed by each upstream MCP server.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ToolCache {
     cache: Arc<RwLock<HashMap<String, Vec<Value>>>>,
 }
 
 impl ToolCache {
     pub fn new() -> Self {
-        Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     pub async fn set_tools(&self, upstream_name: &str, tools: Vec<Value>) {

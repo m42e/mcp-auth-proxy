@@ -350,7 +350,7 @@ impl StdioUpstream {
             let mut pending = managed.pending.write().await;
             if let Some(upstream_id) = pending
                 .iter()
-                .find(|(_, request)| &request.source_id == &cancelled_id)
+                .find(|(_, request)| request.source_id == cancelled_id)
                 .map(|(upstream_id, _)| upstream_id.clone())
             {
                 let _ = pending.remove(&upstream_id);
@@ -757,27 +757,24 @@ impl StdioUpstream {
                 );
             }
 
-            if response.get("error").is_none() {
-                if response
+            if response.get("error").is_none()
+                && response
                     .pointer("/result/supportedVersions")
                     .and_then(Value::as_array)
                     .is_some()
-                {
-                    if versions.iter().any(|v| v == MODERN_PROTOCOL_VERSION) {
-                        if response.pointer("/result/capabilities/tools").is_some() {
-                            return self.fetch_modern_tools(MODERN_PROTOCOL_VERSION).await;
-                        }
-                        return Ok(Vec::new());
+            {
+                if versions.iter().any(|v| v == MODERN_PROTOCOL_VERSION) {
+                    if response.pointer("/result/capabilities/tools").is_some() {
+                        return self.fetch_modern_tools(MODERN_PROTOCOL_VERSION).await;
                     }
-                    if let Some(version) =
-                        latest_legacy_version(versions.iter().map(String::as_str))
-                    {
-                        return self.fetch_legacy_tools(version).await;
-                    }
-                    anyhow::bail!(
-                        "MCP discovery returned no protocol version compatible with this proxy"
-                    );
+                    return Ok(Vec::new());
                 }
+                if let Some(version) = latest_legacy_version(versions.iter().map(String::as_str)) {
+                    return self.fetch_legacy_tools(version).await;
+                }
+                anyhow::bail!(
+                    "MCP discovery returned no protocol version compatible with this proxy"
+                );
             }
         }
 

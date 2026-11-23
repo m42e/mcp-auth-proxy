@@ -29,8 +29,12 @@ impl EncryptedFileStorage {
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create token storage directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create token storage directory: {}",
+                    parent.display()
+                )
+            })?;
         }
 
         Ok(Self {
@@ -58,10 +62,9 @@ impl EncryptedFileStorage {
                 let (nonce_bytes, ciphertext) = encrypted.split_at(12);
                 let nonce = Nonce::from_slice(nonce_bytes);
 
-                let plaintext = self
-                    .cipher
-                    .decrypt(nonce, ciphertext)
-                    .map_err(|_| anyhow::anyhow!("failed to decrypt token file — key mismatch or corruption"))?;
+                let plaintext = self.cipher.decrypt(nonce, ciphertext).map_err(|_| {
+                    anyhow::anyhow!("failed to decrypt token file — key mismatch or corruption")
+                })?;
 
                 serde_json::from_slice(&plaintext)
                     .context("failed to parse decrypted token data")?
@@ -75,8 +78,7 @@ impl EncryptedFileStorage {
     }
 
     async fn save(&self, data: &HashMap<String, String>) -> Result<()> {
-        let plaintext =
-            serde_json::to_vec(data).context("failed to serialize token data")?;
+        let plaintext = serde_json::to_vec(data).context("failed to serialize token data")?;
 
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
